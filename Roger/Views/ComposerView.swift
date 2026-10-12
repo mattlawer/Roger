@@ -12,7 +12,7 @@ struct ComposerView: View {
     @State private var pastedImages = 0
 
     private var canSend: Bool {
-        !(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty) && model.status.isConnected && !model.isGenerating && !imageConflict
+        !(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty) && model.status.isConnected && !model.isGenerating && !model.isBenchmarking && !imageConflict
     }
 
     /// Images are attached but the chat's model is known not to support vision.
@@ -73,7 +73,8 @@ struct ComposerView: View {
                     ContextMeter(plan: model.contextPlan(for: convo), modelName: model.currentModelName,
                                  configuredWindow: model.settings.contextLength,
                                  modelMax: model.currentModelName.flatMap { model.modelStats[$0]?.contextLength },
-                                 lastPromptTokens: convo.messages.last(where: { $0.promptTokens != nil })?.promptTokens)
+                                 lastPromptTokens: convo.messages.last(where: { $0.promptTokens != nil })?.promptTokens,
+                                 cutCount: model.cuttableMessageCount) { model.cutTrimmedMessages() }
                 }
             }
             .frame(minHeight: 14)
@@ -172,7 +173,11 @@ struct ContextMeter: View {
     let configuredWindow: Int
     let modelMax: Int?
     let lastPromptTokens: Int?
+    /// Oldest messages that no longer fit the window; the scissors remove them from the chat.
+    var cutCount = 0
+    var onCut: () -> Void = {}
     @State private var showDetails = false
+    @State private var confirmCut = false
 
     private var color: Color {
         if plan.exceedsWindow { return .red }
@@ -181,28 +186,42 @@ struct ContextMeter: View {
     }
 
     var body: some View {
-        Button { showDetails.toggle() } label: {
-            HStack(spacing: 5) {
-                ZStack {
-                    Circle().stroke(Color.primary.opacity(0.12), lineWidth: 2)
-                    Circle()
-                        .trim(from: 0, to: min(1, plan.fraction))
-                        .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
+        HStack(spacing: 6) {
+            Button { showDetails.toggle() } label: {
+                HStack(spacing: 5) {
+                    ZStack {
+                        Circle().stroke(Color.primary.opacity(0.12), lineWidth: 2)
+                        Circle()
+                            .trim(from: 0, to: min(1, plan.fraction))
+                            .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                    }
+                    .frame(width: 11, height: 11)
+                    Text("≈\(TokenEstimator.format(plan.totalTokens)) / \(TokenEstimator.format(plan.window))")
+                        .font(.caption2).monospacedDigit()
                 }
-                .frame(width: 11, height: 11)
-                Text("≈\(TokenEstimator.format(plan.totalTokens)) / \(TokenEstimator.format(plan.window))")
-                    .font(.caption2).monospacedDigit()
-                if plan.trimmedCount > 0 {
-                    Image(systemName: "scissors").font(.caption2)
-                }
+                .foregroundStyle(color)
+                .contentShape(Rectangle())
             }
-            .foregroundStyle(color)
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .help("Estimated context window use. Click for details.")
+            .popover(isPresented: $showDetails, arrowEdge: .bottom) { details }
+            if cutCount > 0 {
+                Button { confirmCut = true } label: { Image(systemName: "scissors").font(.caption2) }
+                    .buttonStyle(.hoverPress)
+                    .foregroundStyle(color)
+                    .accessibilityLabel("Cut older messages")
+                    .help(plan.autoTrim
+                          ? "The oldest \(cutCount) message\(cutCount == 1 ? " is" : "s are") no longer sent to the model. Click to remove \(cutCount == 1 ? "it" : "them") from the chat."
+                          : "The chat exceeds the context window. Click to remove the oldest \(cutCount) message\(cutCount == 1 ? "" : "s") so the rest fits.")
+                    .confirmationDialog("Remove the oldest \(cutCount) message\(cutCount == 1 ? "" : "s") from this chat?", isPresented: $confirmCut, titleVisibility: .visible) {
+                        Button("Remove \(cutCount) message\(cutCount == 1 ? "" : "s")", role: .destructive) { onCut() }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("Whole turns are removed, from the oldest, until the chat fits the model's context window. This cannot be undone.")
+                    }
+            }
         }
-        .buttonStyle(.plain)
-        .help("Estimated context window use. Click for details.")
-        .popover(isPresented: $showDetails, arrowEdge: .bottom) { details }
     }
 
     private var details: some View {
@@ -215,6 +234,9 @@ struct ContextMeter: View {
                 row("Reserved for the reply", "\(plan.reserve.formatted()) tokens")
                 if plan.trimmedCount > 0 {
                     row("Trimmed", "\(plan.trimmedCount) oldest message\(plan.trimmedCount == 1 ? "" : "s") not sent; ≈ \(plan.sentTokens.formatted()) tokens go to the model")
+                }
+                if cutCount > 0 {
+                    row("Scissors", "remove the oldest \(cutCount) message\(cutCount == 1 ? "" : "s") from the chat")
                 }
                 if let lastPromptTokens {
                     row("Last request", "\(lastPromptTokens.formatted()) prompt tokens, as counted by Ollama")

@@ -16,6 +16,9 @@ enum ToolRegistry {
     }
 
     static func isCommand(_ name: String) -> Bool { name == runCommand }
+    /// Tools after which the files or environment may differ, so repeating an earlier
+    /// read, search or command is legitimate again.
+    static func changesState(_ name: String) -> Bool { [writeFile, editFile, runCommand].contains(name) }
     static func isWeb(_ name: String) -> Bool { name == webSearch || name == fetchURL }
 
     /// Tool definitions for a request; internet tools only when the user enabled them.

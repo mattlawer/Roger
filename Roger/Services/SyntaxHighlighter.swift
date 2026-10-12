@@ -28,17 +28,10 @@ enum SyntaxHighlighter {
 
     static func highlight(_ code: String, language: String) -> AttributedString {
         let lang = normalize(language, code: code)
-        let key = lang + "\u{0}" + code
-        if let cached = cache[key] { return cached }
-        let result: AttributedString
-        if let spec = specs[lang] {
-            result = render(tokenize(code, spec: spec))
-        } else {
-            result = AttributedString(code)
+        return cache.value(for: lang + "\u{0}" + code) {
+            if let spec = specs[lang] { return render(tokenize(code, spec: spec)) }
+            return AttributedString(code)
         }
-        if cache.count > 64 { cache.removeAll() }
-        cache[key] = result
-        return result
     }
 
     /// Canonical language name for a fence tag, guessing from the code when the tag is empty.
@@ -50,7 +43,7 @@ enum SyntaxHighlighter {
 
     // MARK: - Languages
 
-    private static var cache: [String: AttributedString] = [:]
+    private static let cache = RenderCache<AttributedString>(capacity: 128)
 
     private static let aliases: [String: String] = [
         "py": "python", "python3": "python", "js": "javascript", "jsx": "javascript", "mjs": "javascript", "cjs": "javascript",
@@ -419,5 +412,30 @@ enum SyntaxHighlighter {
             let c = isDark ? dark : light
             return NSColor(srgbRed: c.0 / 255, green: c.1 / 255, blue: c.2 / 255, alpha: 1)
         })
+    }
+}
+
+/// A small cache for rendering work (highlighted code, parsed inline Markdown) keyed by the
+/// text it was made from. Used from view bodies only, so always on the main thread. When it
+/// is full, the oldest quarter of the entries goes, so a reply that adds an entry on every
+/// refresh while it streams never pushes out everything else at once.
+final class RenderCache<Value> {
+    private var values: [String: Value] = [:]
+    private var order: [String] = []
+    private let capacity: Int
+
+    init(capacity: Int) { self.capacity = capacity }
+
+    func value(for key: String, or make: () -> Value) -> Value {
+        if let cached = values[key] { return cached }
+        let made = make()
+        values[key] = made
+        order.append(key)
+        if order.count > capacity {
+            let dropped = order.prefix(max(1, capacity / 4))
+            for k in dropped { values.removeValue(forKey: k) }
+            order.removeFirst(dropped.count)
+        }
+        return made
     }
 }

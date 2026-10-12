@@ -29,10 +29,6 @@ struct ContentView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            Button { model.newConversation() } label: { Label("New Chat", systemImage: "square.and.pencil") }
-                .help("New chat (⌘N)")
-        }
         ToolbarItemGroup(placement: .primaryAction) {
             workingDirectoryButton
             modelPicker

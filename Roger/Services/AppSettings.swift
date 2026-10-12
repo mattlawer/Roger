@@ -23,6 +23,11 @@ final class AppSettings {
     var autoApproveFileEdits: Bool { didSet { defaults.set(autoApproveFileEdits, forKey: "autoApproveFileEdits") } }
     var autoApproveCommands: Bool { didSet { defaults.set(autoApproveCommands, forKey: "autoApproveCommands") } }
     var maxToolIterations: Int { didSet { defaults.set(maxToolIterations, forKey: "maxToolIterations") } }
+    /// Minutes to keep a model loaded between requests. -1 keeps it loaded until Ollama
+    /// stops; 0 uses Ollama's own default (5 minutes). Keeping it loaded across a tool loop
+    /// avoids reloading a large model between steps, which on a tight-memory Mac can exceed
+    /// Ollama's load timeout and fail mid-answer.
+    var keepAliveMinutes: Int { didSet { defaults.set(keepAliveMinutes, forKey: "keepAliveMinutes") } }
     var customInstructions: String { didSet { defaults.set(customInstructions, forKey: "customInstructions") } }
     var useLoginShell: Bool { didSet { defaults.set(useLoginShell, forKey: "useLoginShell") } }
     var autoTrimContext: Bool { didSet { defaults.set(autoTrimContext, forKey: "autoTrimContext") } }
@@ -54,6 +59,7 @@ final class AppSettings {
         autoApproveFileEdits = defaults.bool(forKey: "autoApproveFileEdits")
         autoApproveCommands = defaults.bool(forKey: "autoApproveCommands")
         maxToolIterations = defaults.object(forKey: "maxToolIterations") as? Int ?? 15
+        keepAliveMinutes = defaults.object(forKey: "keepAliveMinutes") as? Int ?? 30
         customInstructions = defaults.string(forKey: "customInstructions") ?? ""
         useLoginShell = defaults.object(forKey: "useLoginShell") as? Bool ?? false
         autoTrimContext = defaults.object(forKey: "autoTrimContext") as? Bool ?? true
@@ -68,6 +74,15 @@ final class AppSettings {
         torPort = defaults.object(forKey: "torPort") as? Int ?? 9050
         torControlPort = defaults.object(forKey: "torControlPort") as? Int ?? 9051
         torControlPassword = defaults.string(forKey: "torControlPassword") ?? ""
+    }
+
+    /// The keep_alive value to send to Ollama, or nil to use its default.
+    var keepAlive: Any? {
+        switch keepAliveMinutes {
+        case 0: return nil
+        case ..<0: return -1
+        default: return "\(keepAliveMinutes)m"
+        }
     }
 
     var hostURL: URL {

@@ -12,7 +12,8 @@ struct OllamaModelInfo: Codable, Identifiable, Hashable {
         var embeddingLength: Int?
     }
 
-    var id: String { name }
+    /// Ollama 0.40 can list one name twice with different digests; keep SwiftUI ids unique.
+    var id: String { "\(name)#\(digest ?? "")" }
     var name: String
     var model: String?
     var size: Int64?
@@ -24,6 +25,14 @@ struct OllamaModelInfo: Codable, Identifiable, Hashable {
     var supportsTools: Bool? { capabilities.map { $0.contains("tools") } }
     var supportsVision: Bool { capabilities?.contains("vision") ?? false }
     var supportsThinking: Bool { capabilities?.contains("thinking") ?? false }
+
+    /// Ollama 0.40+ registers `llamacpp:<digest>` or `mlx:<digest>` aliases for the runner it
+    /// used to load a model. They are bookkeeping, not models the user installed.
+    var isRunnerAlias: Bool {
+        guard let colon = name.firstIndex(of: ":") else { return false }
+        let tag = name[name.index(after: colon)...]
+        return tag.count == 64 && tag.allSatisfy(\.isHexDigit) && !name[..<colon].contains("/")
+    }
 
     var sizeDescription: String {
         guard let size else { return "" }
@@ -61,6 +70,8 @@ struct RunningModel: Codable, Identifiable, Hashable {
     var expiresAt: String?
     var contextLength: Int?
     var details: OllamaModelInfo.Details?
+    /// "llamacpp" or "mlx" on Ollama 0.40+, nil on older servers.
+    var runner: String?
 }
 
 /// Response of /api/show, reduced to what Roger displays.
@@ -134,6 +145,22 @@ struct ModelStats: Hashable {
 
 struct OllamaPsResponse: Codable {
     var models: [RunningModel]
+}
+
+/// Response of a non-streaming /api/generate call, with Ollama's timing counters.
+struct GenerateResponse: Decodable {
+    var model: String?
+    var response: String?
+    var thinking: String?
+    var done: Bool?
+    var doneReason: String?
+    var totalDuration: Int64?
+    var loadDuration: Int64?
+    var promptEvalCount: Int?
+    var promptEvalDuration: Int64?
+    var evalCount: Int?
+    var evalDuration: Int64?
+    var error: String?
 }
 
 struct PullProgress: Codable, Hashable {
