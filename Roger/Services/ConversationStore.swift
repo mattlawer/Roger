@@ -18,8 +18,7 @@ final class ConversationStore {
     }()
 
     init() {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        directory = base.appendingPathComponent("Roger/Conversations", isDirectory: true)
+        directory = AppData.directory.appendingPathComponent("Conversations", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -58,4 +57,17 @@ final class ConversationStore {
     func delete(_ id: UUID) {
         try? FileManager.default.removeItem(at: url(for: id))
     }
+}
+
+/// Where Roger keeps its chats and benchmarks: Application Support/Roger, or the folder in
+/// ROGER_DATA_DIR so a test instance has a store of its own, away from the user's data. (A
+/// different HOME does not do that: Application Support is resolved from the user record.)
+enum AppData {
+    static let directory: URL = {
+        if let dir = ProcessInfo.processInfo.environment["ROGER_DATA_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: dir, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Roger", isDirectory: true)
+    }()
 }

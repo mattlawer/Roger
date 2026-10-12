@@ -42,6 +42,15 @@ struct SettingsView: View {
                 }
                 Text("Applies to thinking models such as qwen3 or deepseek-r1. “Hide” still lets the model reason but keeps it out of the chat; “Off” sends Ollama's think=false, which is faster but can lower answer quality. When a model answers only inside its reasoning, Roger shows that reasoning as the reply and labels it.")
                     .font(.caption).foregroundStyle(.secondary)
+                Picker("Keep model loaded", selection: $settings.keepAliveMinutes) {
+                    Text("Ollama default (5 min)").tag(0)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                    Text("Until Ollama stops").tag(-1)
+                }
+                Text("How long Ollama keeps a model in memory between messages. A longer time avoids reloading a large model on every tool step, which on a memory-tight Mac can time out and fail mid-answer. It also holds memory for that long after you stop.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Trim the oldest messages when a chat outgrows the context window", isOn: $settings.autoTrimContext)
                 Text("Roger estimates the size of each chat and, when it no longer fits, stops sending the oldest turns to the model. The messages stay in the chat; a divider shows where the model's view starts. With this off, the whole chat is sent and the model may lose track of the beginning.")
                     .font(.caption).foregroundStyle(.secondary)

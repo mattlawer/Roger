@@ -20,6 +20,7 @@
 		55DB348050D542AAAF2B071A /* TorStatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3700EAF5002485F0D3EFEE2D /* TorStatusView.swift */; };
 		7696F758702FE80B80142628 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 173B0F45464690EBE522807C /* ChatView.swift */; };
 		810F0A12944B0F0E98AD1485 /* OllamaTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD4EAE27EF254FC0DA6C6112 /* OllamaTypes.swift */; };
+		88D8527823F0077665E287D7 /* ModelBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = 408BC6909A1F4B9EDF37C998 /* ModelBenchmark.swift */; };
 		8B0FB0F1052FD990BEB2234C /* Tools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 459EF13D9148A43DC1688E0C /* Tools.swift */; };
 		8DB47C801EA0B23EDDDF8091 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29FE9149AB86264D49239A1B /* SettingsView.swift */; };
 		963DA7C39F6DA43ADCCA9436 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 9865387030FA6839BB804035 /* Assets.xcassets */; };
@@ -50,6 +51,7 @@
 		29FE9149AB86264D49239A1B /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		310745127ABFF488FD297369 /* DisclosureRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisclosureRow.swift; sourceTree = "<group>"; };
 		3700EAF5002485F0D3EFEE2D /* TorStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorStatusView.swift; sourceTree = "<group>"; };
+		408BC6909A1F4B9EDF37C998 /* ModelBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelBenchmark.swift; sourceTree = "<group>"; };
 		414A8E9B0AD6B26B920216A0 /* MessageRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageRow.swift; sourceTree = "<group>"; };
 		459EF13D9148A43DC1688E0C /* Tools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tools.swift; sourceTree = "<group>"; };
 		4E2C826A01B02B586751A899 /* TorManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorManager.swift; sourceTree = "<group>"; };
@@ -113,6 +115,7 @@
 				222F0B48B86E9FB350AAA1E7 /* ContextBudget.swift */,
 				CAD1149725781A3552E04235 /* ConversationStore.swift */,
 				7BA3C748309FC228E5AB16CA /* Diff.swift */,
+				408BC6909A1F4B9EDF37C998 /* ModelBenchmark.swift */,
 				0F0C101B47E4329BF76A1B75 /* OllamaClient.swift */,
 				658B0B8BC8AC2FF0106AB99A /* SyntaxHighlighter.swift */,
 				459EF13D9148A43DC1688E0C /* Tools.swift */,
@@ -243,6 +246,7 @@
 				9B9D05504EE700BB74F4B436 /* JSONValue.swift in Sources */,
 				EA45F2F2242D064237DBCDBC /* MarkdownView.swift in Sources */,
 				14535B989FD39BB6337BECA3 /* MessageRow.swift in Sources */,
+				88D8527823F0077665E287D7 /* ModelBenchmark.swift in Sources */,
 				F770C2F2E9E5D6E56D931957 /* ModelsView.swift in Sources */,
 				B5B370D4F084FEA02D3B783A /* OllamaClient.swift in Sources */,
 				810F0A12944B0F0E98AD1485 /* OllamaTypes.swift in Sources */,

@@ -5,7 +5,7 @@ struct ToolCallCard: View {
     let call: ToolCall
     let messageID: UUID
 
-    private var isPending: Bool { call.status == .pending && model.pendingApprovalID == call.id }
+    private var isPending: Bool { call.status == .pending && model.isApprovalPending(call.id) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -24,7 +24,7 @@ struct ToolCallCard: View {
             preview
             if isPending {
                 HStack(spacing: 8) {
-                    Button("Allow") { model.resolveApproval(.allow) }
+                    Button("Allow") { model.resolveApproval(.allow, for: call.id) }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
                     Menu("Always allow…") {
@@ -34,8 +34,8 @@ struct ToolCallCard: View {
                     }
                     .fixedSize()
                     .help("Remember this choice for the working directory and its subfolders. Manage remembered approvals in Settings.")
-                    Button("Allow all this session") { model.resolveApproval(.allowAll) }
-                    Button("Deny", role: .destructive) { model.resolveApproval(.deny) }
+                    Button("Allow all this session") { model.resolveApproval(.allowAll, for: call.id) }
+                    Button("Deny", role: .destructive) { model.resolveApproval(.deny, for: call.id) }
                         .keyboardShortcut(.cancelAction)
                     Spacer()
                     Text("Roger wants to \(actionVerb).").font(.caption).foregroundStyle(.secondary)
@@ -58,7 +58,7 @@ struct ToolCallCard: View {
                 }
                 if expanded {
                     if call.name == ToolRegistry.webSearch, call.status == .done {
-                        MarkdownView(text: result)
+                        MarkdownView(text: result, canSendOutput: false)
                             .padding(8)
                             .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
                     } else {
@@ -126,7 +126,7 @@ struct ToolCallCard: View {
         switch call.status {
         case .denied, .failed: return .red
         case .pending: return .orange
-        case .cancelled: return .secondary
+        case .cancelled, .skipped: return .secondary
         default: return .accentColor
         }
     }
@@ -183,6 +183,8 @@ struct ToolCallCard: View {
             Text("Denied").font(.caption).foregroundStyle(.red)
         case .cancelled:
             Text("Stopped").font(.caption).foregroundStyle(.secondary)
+        case .skipped:
+            Text("Repeated").font(.caption).foregroundStyle(.secondary)
         }
     }
 

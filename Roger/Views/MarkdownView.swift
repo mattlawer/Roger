@@ -1,19 +1,20 @@
 import SwiftUI
 import QuickLook
 
-enum MarkdownBlock: Identifiable, Hashable {
+enum MarkdownBlock: Hashable {
     case paragraph(String)
     case heading(Int, String)
-    case code(lang: String, code: String)
-    case list(items: [String], ordered: Bool)
+    /// `complete` is false while the closing fence has not arrived yet (a streaming reply).
+    case code(lang: String, code: String, complete: Bool)
+    /// `start` is the number of the first item of an ordered list, so a list that a code
+    /// block or a paragraph interrupted continues its numbering.
+    case list(items: [String], ordered: Bool, start: Int)
     case quote(String)
     case table([String])
     case rule
     /// An image the text refers to. `explicit` is Markdown image syntax; otherwise it is a
     /// bare path the model mentioned, shown only if the file exists.
     case image(alt: String, source: String, explicit: Bool)
-
-    var id: Int { hashValue }
 }
 
 enum MarkdownParser {
@@ -24,8 +25,12 @@ enum MarkdownParser {
         var paragraph: [String] = []
         var listItems: [String] = []
         var listOrdered = false
+        var listStart = 1
         var quote: [String] = []
         var table: [String] = []
+        /// The block most recently added was a list: indented lines that follow belong to it
+        /// (nested items, continuation text), not to an indented code block.
+        var afterList = false
 
         func flushParagraph() {
             if !paragraph.isEmpty {
@@ -33,6 +38,7 @@ enum MarkdownParser {
                 if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { blocks.append(.paragraph(text)) }
                 blocks.append(contentsOf: images)
                 paragraph = []
+                afterList = false
             }
         }
         func flushList() {
@@ -43,33 +49,59 @@ enum MarkdownParser {
                     images.append(contentsOf: found)
                     return text
                 }
-                blocks.append(.list(items: items, ordered: listOrdered))
+                blocks.append(.list(items: items, ordered: listOrdered, start: listStart))
                 blocks.append(contentsOf: images)
                 listItems = []
+                afterList = true
             }
         }
         func flushQuote() {
-            if !quote.isEmpty { blocks.append(.quote(quote.joined(separator: "\n"))); quote = [] }
+            if !quote.isEmpty { blocks.append(.quote(quote.joined(separator: "\n"))); quote = []; afterList = false }
         }
         func flushTable() {
-            if !table.isEmpty { blocks.append(.table(table)); table = [] }
+            if !table.isEmpty { blocks.append(.table(table)); table = []; afterList = false }
         }
         func flushAll() { flushParagraph(); flushList(); flushQuote(); flushTable() }
+
+        // A reply that begins inside a code block (the model continuing one it could no longer
+        // see): indented code first, then a bare closing fence before any opening one. All of
+        // it up to that fence is code.
+        func isFence(_ l: String) -> Bool { let t = l.trimmingCharacters(in: .whitespaces); return t.hasPrefix("```") || t.hasPrefix("~~~") }
+        func fenceTag(_ l: String) -> String { l.trimmingCharacters(in: .whitespaces).dropFirst(3).trimmingCharacters(in: .whitespaces) }
+        if let first = lines.firstIndex(where: isFence), fenceTag(lines[first]).isEmpty,
+           let next = lines[(first + 1)...].firstIndex(where: isFence), !fenceTag(lines[next]).isEmpty,
+           let firstText = lines[..<first].first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+           firstText.first?.isWhitespace == true {
+            let code = lines[..<first].joined(separator: "\n").trimmingCharacters(in: .newlines)
+            blocks.append(.code(lang: "", code: code, complete: true))
+            i = first + 1
+        }
 
         while i < lines.count {
             let line = lines[i]
             let trimmed = line.trimmingCharacters(in: .whitespaces)
 
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                flushAll()
                 let fence = String(trimmed.prefix(3))
                 let lang = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
+                // A bare fence whose next fence carries a language is a stray closing fence,
+                // not an opener: models sometimes start a reply as if a code block were
+                // already open. Skipping it keeps the text after it as Markdown and lets the
+                // tagged fence open the real block.
+                if lang.isEmpty,
+                   let next = lines[(i + 1)...].firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix(fence) }),
+                   !lines[next].trimmingCharacters(in: .whitespaces).dropFirst(3).trimmingCharacters(in: .whitespaces).isEmpty {
+                    i += 1
+                    continue
+                }
+                flushAll()
                 var code: [String] = []
                 i += 1
                 while i < lines.count, !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix(fence) {
                     code.append(lines[i]); i += 1
                 }
-                blocks.append(.code(lang: lang, code: code.joined(separator: "\n")))
+                blocks.append(.code(lang: lang, code: code.joined(separator: "\n"), complete: i < lines.count))
+                afterList = false
                 i += 1
                 continue
             }
@@ -78,12 +110,34 @@ enum MarkdownParser {
                 flushAll(); i += 1; continue
             }
 
+            // An indented code block (four spaces or a tab) at a block boundary, as models
+            // often write instead of fences. It cannot interrupt a paragraph or a list, where
+            // such lines are continuation text. Blank lines inside it are kept; trailing ones
+            // are left to the normal flow.
+            if paragraph.isEmpty, listItems.isEmpty, quote.isEmpty, table.isEmpty, !afterList, isIndentedCode(line) {
+                var code: [String] = []
+                var j = i
+                var pendingBlank = 0
+                while j < lines.count {
+                    let l = lines[j]
+                    if l.trimmingCharacters(in: .whitespaces).isEmpty { pendingBlank += 1; j += 1; continue }
+                    guard isIndentedCode(l) else { break }
+                    code.append(contentsOf: Array(repeating: "", count: pendingBlank)); pendingBlank = 0
+                    code.append(dedent(l))
+                    j += 1
+                }
+                // Still growing while the reply streams unless something follows it.
+                blocks.append(.code(lang: "", code: code.joined(separator: "\n"), complete: j < lines.count))
+                i = j - pendingBlank
+                continue
+            }
+
             if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-                flushAll(); blocks.append(.rule); i += 1; continue
+                flushAll(); blocks.append(.rule); afterList = false; i += 1; continue
             }
 
             if let heading = parseHeading(trimmed) {
-                flushAll(); blocks.append(.heading(heading.0, heading.1)); i += 1; continue
+                flushAll(); blocks.append(.heading(heading.0, heading.1)); afterList = false; i += 1; continue
             }
 
             if trimmed.hasPrefix(">") {
@@ -103,6 +157,7 @@ enum MarkdownParser {
             if let item = parseListItem(line) {
                 flushParagraph(); flushQuote(); flushTable()
                 if !listItems.isEmpty, listOrdered != item.ordered { flushList() }
+                if listItems.isEmpty { listStart = item.number ?? 1 }
                 listOrdered = item.ordered
                 listItems.append(item.text)
                 i += 1; continue
@@ -126,9 +181,17 @@ enum MarkdownParser {
         pattern: "(?<![\\w/.\\-])((?:https?://[^\\s)\"'`<>]+|(?:~/|\\.{1,2}/|/)?(?:[\\w.\\-]+/)*[\\w.\\-]+)\\.(?:png|jpe?g|gif|webp|heic|bmp|tiff?|svg))(?![\\w/\\-])",
         options: [.caseInsensitive])
 
+    /// Results for the paragraphs seen most recently. A streaming reply is parsed again on
+    /// every refresh, and only its last paragraph has changed.
+    private static let imageCache = RenderCache<(String, [MarkdownBlock])>(capacity: 2048)
+
     /// Pulls image references out of a text run: Markdown images are removed from the text
     /// (their alt text stays) and bare image paths are reported as candidates.
     static func extractImages(_ text: String) -> (String, [MarkdownBlock]) {
+        imageCache.value(for: text) { extractImagesUncached(text) }
+    }
+
+    private static func extractImagesUncached(_ text: String) -> (String, [MarkdownBlock]) {
         var images: [MarkdownBlock] = []
         var seen: Set<String> = []
         let ns = text as NSString
@@ -151,6 +214,14 @@ enum MarkdownParser {
         return (cleaned, images)
     }
 
+    private static func isIndentedCode(_ line: String) -> Bool {
+        line.hasPrefix("    ") || line.hasPrefix("\t")
+    }
+
+    private static func dedent(_ line: String) -> String {
+        line.hasPrefix("\t") ? String(line.dropFirst()) : String(line.dropFirst(4))
+    }
+
     private static func parseHeading(_ s: String) -> (Int, String)? {
         var level = 0
         var idx = s.startIndex
@@ -159,30 +230,44 @@ enum MarkdownParser {
         return (level, String(s[idx...]).trimmingCharacters(in: .whitespaces))
     }
 
-    private static func parseListItem(_ line: String) -> (text: String, ordered: Bool)? {
+    private static func parseListItem(_ line: String) -> (text: String, ordered: Bool, number: Int?)? {
         let t = line.trimmingCharacters(in: .whitespaces)
         for marker in ["- ", "* ", "+ ", "• "] where t.hasPrefix(marker) {
-            return (String(t.dropFirst(marker.count)), false)
+            return (String(t.dropFirst(marker.count)), false, nil)
         }
-        if t.hasPrefix("- [ ] ") || t.hasPrefix("- [x] ") { return (String(t.dropFirst(2)), false) }
+        if t.hasPrefix("- [ ] ") || t.hasPrefix("- [x] ") { return (String(t.dropFirst(2)), false, nil) }
         var digits = 0
         var idx = t.startIndex
         while idx < t.endIndex, t[idx].isNumber, digits < 4 { digits += 1; idx = t.index(after: idx) }
         if digits > 0, idx < t.endIndex, t[idx] == "." || t[idx] == ")" {
             let after = t.index(after: idx)
-            if after < t.endIndex, t[after] == " " { return (String(t[after...]).trimmingCharacters(in: .whitespaces), true) }
+            if after < t.endIndex, t[after] == " " {
+                return (String(t[after...]).trimmingCharacters(in: .whitespaces), true, Int(t[..<idx]))
+            }
         }
         return nil
     }
 }
 
+/// Renders Markdown text. It stores only comparable values (no closures), so SwiftUI skips
+/// it entirely while its text is unchanged.
 struct MarkdownView: View {
     let text: String
-    var onRunCommand: ((String) -> Void)? = nil
+    /// Offer to send the output of a command run from a code block back to the model.
+    var canSendOutput = true
+    /// Whether the text can be selected. Off while a reply streams: selectable text is an
+    /// AppKit text field under the hood, and updating those on every refresh is what kept
+    /// the main thread busy (and, once, spinning) during long replies.
+    var selectable = true
+    /// Smaller headings, for the thinking section.
+    var compact = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(MarkdownParser.parse(text)) { block in
+        // Blocks are identified by position, so the paragraph or code block at the end of a
+        // streaming reply is updated in place on every refresh instead of being replaced.
+        let blocks = MarkdownParser.parse(text)
+        return VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 render(block)
             }
         }
@@ -193,36 +278,33 @@ struct MarkdownView: View {
     private func render(_ block: MarkdownBlock) -> some View {
         switch block {
         case .paragraph(let s):
-            Text(inline(s)).textSelection(.enabled).lineSpacing(3)
+            Text(inline(s)).selectable(selectable).lineSpacing(3)
         case .heading(let level, let s):
             Text(inline(s))
-                .font(level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline)
+                .font(compact ? (level <= 2 ? .headline : .subheadline.bold())
+                              : (level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline))
                 .padding(.top, 4)
-                .textSelection(.enabled)
-        case .code(let lang, let code):
-            CodeBlockView(language: lang, code: code, onRun: onRunCommand)
-        case .list(let items, let ordered):
+                .selectable(selectable)
+        case .code(let lang, let code, let complete):
+            CodeBlockView(language: lang, code: code, complete: complete, canSendOutput: canSendOutput, selectable: selectable)
+        case .list(let items, let ordered, let start):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(ordered ? "\(idx + 1)." : "•")
+                        Text(ordered ? "\(start + idx)." : "•")
                             .foregroundStyle(.secondary)
                             .frame(minWidth: 16, alignment: .trailing)
-                        Text(inline(item)).textSelection(.enabled)
+                        Text(inline(item)).selectable(selectable)
                     }
                 }
             }
         case .quote(let s):
             HStack(spacing: 10) {
                 RoundedRectangle(cornerRadius: 2).fill(Color.accentColor.opacity(0.6)).frame(width: 3)
-                Text(inline(s)).foregroundStyle(.secondary).textSelection(.enabled)
+                Text(inline(s)).foregroundStyle(.secondary).selectable(selectable)
             }
         case .table(let rows):
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(rows.joined(separator: "\n"))
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-            }
+            table(rows)
         case .rule:
             Divider()
         case .image(let alt, let source, let explicit):
@@ -230,18 +312,60 @@ struct MarkdownView: View {
         }
     }
 
-    private func inline(_ s: String) -> AttributedString {
-        if let a = try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            return a
+    /// A Markdown table: the first row is the header and cells keep inline Markdown such as
+    /// bold. Columns are as wide as their content; when the table is wider than the chat, the
+    /// wide columns give way and their cells wrap (see `TableLayout`). Cells are rendered one
+    /// by one, so while a table streams only its last row is new work.
+    private func table(_ rows: [String]) -> some View {
+        let parsed = rows.map(Self.tableCells)
+        let columns = max(1, parsed.first?.count ?? 1)
+        let cells = parsed.flatMap { row in (0..<columns).map { $0 < row.count ? row[$0] : "" } }
+        return TableLayout(columns: columns) {
+            ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
+                let header = index < columns
+                Text(inline(cell))
+                    .fontWeight(header ? .semibold : .regular)
+                    .padding(.trailing, 16)
+                    .padding(.bottom, header ? 5 : 0)
+                    .overlay(alignment: .bottom) {
+                        if header { Rectangle().fill(Color.secondary.opacity(0.35)).frame(height: 1) }
+                    }
+                    .selectable(selectable)
+            }
         }
-        return AttributedString(s)
+        .padding(.vertical, 2)
+    }
+
+    /// The cells of one `| a | b |` row.
+    static func tableCells(_ row: String) -> [String] {
+        var r = Substring(row.trimmingCharacters(in: .whitespaces))
+        if r.hasPrefix("|") { r = r.dropFirst() }
+        if r.hasSuffix("|") { r = r.dropLast() }
+        return r.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Inline Markdown for the paragraphs rendered most recently. While a reply streams, every
+    /// refresh renders all of its paragraphs again and only the last one has changed.
+    private static let inlineCache = RenderCache<AttributedString>(capacity: 2048)
+
+    private func inline(_ s: String) -> AttributedString {
+        Self.inlineCache.value(for: s) {
+            (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                ?? AttributedString(s)
+        }
     }
 }
 
 struct CodeBlockView: View {
     let language: String
     let code: String
-    var onRun: ((String) -> Void)? = nil
+    /// The closing fence has arrived. Until then (and while the reply still streams) the code
+    /// is shown plain, one Text per line: highlighting and laying out a growing block again
+    /// on every refresh was the main cost of streaming code, whereas with one view per line
+    /// only the last line is new work. The finished block is highlighted once and cached.
+    var complete = true
+    var canSendOutput = true
+    var selectable = true
 
     @Environment(AppModel.self) private var model
     @State private var copied = false
@@ -290,17 +414,28 @@ struct CodeBlockView: View {
                     Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
                 }
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.hoverPress)
             .font(.caption)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(Color.primary.opacity(0.06))
 
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(SyntaxHighlighter.highlight(code, language: language))
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(12)
+                Group {
+                    if complete || selectable {
+                        Text(SyntaxHighlighter.highlight(code, language: language))
+                            .selectable(selectable)
+                    } else {
+                        let lines = code.split(separator: "\n", omittingEmptySubsequences: false)
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(lines.indices, id: \.self) { i in
+                                Text(lines[i].isEmpty ? " " : String(lines[i]))
+                            }
+                        }
+                    }
+                }
+                .font(.system(.callout, design: .monospaced))
+                .padding(12)
             }
 
             if let output {
@@ -315,9 +450,9 @@ struct CodeBlockView: View {
                                 .font(.caption).foregroundStyle(exitCode == 0 ? Color.secondary : Color.orange)
                         }
                         Spacer()
-                        if let onRun, !running {
+                        if canSendOutput, !running {
                             Button("Send output to Roger") {
-                                onRun("I ran `\(command)` and got:\n```\n\(output)\n```")
+                                model.send(text: "I ran `\(command)` and got:\n```\n\(output)\n```", attachments: [])
                             }
                             .font(.caption)
                         }
@@ -364,7 +499,7 @@ struct LiveOutputView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     Text(text.isEmpty ? (isLive ? "Waiting for output…" : "(no output)") : text)
                         .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
+                        .selectable(!isLive)
                         .padding(8)
                     Color.clear.frame(height: 1).id("end")
                 }
@@ -372,7 +507,7 @@ struct LiveOutputView: View {
             .frame(maxHeight: maxHeight)
             .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
             .clipShape(RoundedRectangle(cornerRadius: 6))
-            .onChange(of: text.count) { _, _ in
+            .onChange(of: text.utf8.count) { _, _ in
                 if isLive { proxy.scrollTo("end", anchor: .bottom) }
             }
         }
@@ -464,6 +599,72 @@ struct ImageBlockView: View {
             missing = false
         } else {
             missing = true
+        }
+    }
+}
+
+extension View {
+    /// `textSelection(.enabled)` when `enabled`, plain text otherwise.
+    @ViewBuilder
+    func selectable(_ enabled: Bool) -> some View {
+        if enabled { textSelection(.enabled) } else { self }
+    }
+}
+
+/// Lays out table cells (row-major, `columns` per row). Each column is as wide as its widest
+/// cell when that fits. Otherwise a column can shrink down to `narrowColumnWidth` (or its
+/// own width if it is narrower, so short names and numbers never wrap), and the shortfall is
+/// shared in proportion to how much each column can give, so a column of long notes wraps
+/// while a column of short names keeps its width. Rows are as tall as their tallest cell.
+struct TableLayout: Layout {
+    var columns: Int
+    var rowSpacing: CGFloat = 5
+    var narrowColumnWidth: CGFloat = 120
+
+    private func columnWidths(_ subviews: Subviews, fitting width: CGFloat?) -> [CGFloat] {
+        let cols = max(1, columns)
+        var ideal = [CGFloat](repeating: 0, count: cols)
+        for (i, view) in subviews.enumerated() {
+            ideal[i % cols] = max(ideal[i % cols], view.sizeThatFits(.unspecified).width)
+        }
+        let minimum = ideal.map { min($0, narrowColumnWidth) }
+        let idealTotal = ideal.reduce(0, +), minimumTotal = minimum.reduce(0, +)
+        guard let width, idealTotal > width else { return ideal }
+        guard minimumTotal < width, idealTotal > minimumTotal else { return minimum }
+        let t = (width - minimumTotal) / (idealTotal - minimumTotal)
+        return (0..<cols).map { floor(minimum[$0] + (ideal[$0] - minimum[$0]) * t) }
+    }
+
+    private func rowHeights(_ subviews: Subviews, widths: [CGFloat]) -> [CGFloat] {
+        let cols = widths.count
+        var heights: [CGFloat] = []
+        for (i, view) in subviews.enumerated() {
+            let row = i / cols
+            if row == heights.count { heights.append(0) }
+            let h = view.sizeThatFits(ProposedViewSize(width: widths[i % cols], height: nil)).height
+            heights[row] = max(heights[row], h)
+        }
+        return heights
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let widths = columnWidths(subviews, fitting: proposal.width)
+        let heights = rowHeights(subviews, widths: widths)
+        return CGSize(width: widths.reduce(0, +),
+                      height: heights.reduce(0, +) + rowSpacing * CGFloat(max(0, heights.count - 1)))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let widths = columnWidths(subviews, fitting: bounds.width)
+        let heights = rowHeights(subviews, widths: widths)
+        let cols = widths.count
+        var y = bounds.minY
+        for (i, view) in subviews.enumerated() {
+            let col = i % cols, row = i / cols
+            if col == 0, row > 0 { y += heights[row - 1] + rowSpacing }
+            let x = bounds.minX + widths[..<col].reduce(0, +)
+            view.place(at: CGPoint(x: x, y: y), anchor: .topLeading,
+                       proposal: ProposedViewSize(width: widths[col], height: heights[row]))
         }
     }
 }

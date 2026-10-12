@@ -19,6 +19,14 @@ enum OllamaError: LocalizedError {
         errorDescription?.lowercased().contains("does not support tools") ?? false
     }
 
+    /// Ollama could not start the model runner in time, usually because a large model is
+    /// loading through swap on a memory-tight machine.
+    var isRunnerStartTimeout: Bool {
+        let m = errorDescription?.lowercased() ?? ""
+        return m.contains("timed out waiting for llama") || m.contains("timed out waiting for server")
+            || (m.contains("llama runner") && m.contains("timed out"))
+    }
+
     /// Ollama rejected images for a text-only model.
     var isVisionUnsupported: Bool {
         let m = errorDescription?.lowercased() ?? ""
@@ -121,22 +129,36 @@ struct OllamaClient {
         stream(path: "api/pull", body: ["model": name, "stream": true])
     }
 
-    func chat(model: String, messages: [[String: Any]], tools: [[String: Any]]?, options: [String: Any], think: Bool? = nil) -> AsyncThrowingStream<ChatChunk, Error> {
+    func chat(model: String, messages: [[String: Any]], tools: [[String: Any]]?, options: [String: Any], think: Bool? = nil, keepAlive: Any? = nil) -> AsyncThrowingStream<ChatChunk, Error> {
         var body: [String: Any] = ["model": model, "messages": messages, "stream": true, "options": options]
         if let tools, !tools.isEmpty { body["tools"] = tools }
         if let think { body["think"] = think }
+        if let keepAlive { body["keep_alive"] = keepAlive }
         return stream(path: "api/chat", body: body)
     }
 
     /// One non-streaming chat completion; returns the reply text. Used for short
     /// housekeeping requests such as naming a chat.
-    func chatOnce(model: String, messages: [[String: Any]], options: [String: Any], think: Bool? = nil) async throws -> String {
+    func chatOnce(model: String, messages: [[String: Any]], options: [String: Any], think: Bool? = nil, keepAlive: Any? = nil) async throws -> String {
         var body: [String: Any] = ["model": model, "messages": messages, "stream": false, "options": options]
         if let think { body["think"] = think }
+        if let keepAlive { body["keep_alive"] = keepAlive }
         let data = try await data(for: request("api/chat", method: "POST", body: body))
         let chunk = try Self.decoder.decode(ChatChunk.self, from: data)
         if let e = chunk.error { throw OllamaError.server(e) }
         return chunk.message?.content ?? ""
+    }
+
+    /// One non-streaming /api/generate call, returning Ollama's timing counters as well as
+    /// the text. Used by the model benchmark.
+    func generate(model: String, prompt: String, think: Bool?, options: [String: Any], keepAlive: Any? = nil) async throws -> GenerateResponse {
+        var body: [String: Any] = ["model": model, "prompt": prompt, "stream": false, "options": options]
+        if let think { body["think"] = think }
+        if let keepAlive { body["keep_alive"] = keepAlive }
+        let data = try await data(for: request("api/generate", method: "POST", body: body))
+        let resp = try Self.decoder.decode(GenerateResponse.self, from: data)
+        if let e = resp.error { throw OllamaError.server(e) }
+        return resp
     }
 
     // MARK: - Streaming (newline-delimited JSON)

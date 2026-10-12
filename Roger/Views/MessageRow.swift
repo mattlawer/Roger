@@ -49,21 +49,16 @@ struct MessageRow: View {
                         }
                         if hovering {
                             if !message.content.isEmpty {
-                                Button {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(message.content, forType: .string)
-                                } label: { Label("Copy", systemImage: "doc.on.doc").font(.caption2) }
-                                .buttonStyle(.borderless)
-                                .foregroundStyle(.secondary)
+                                CopyButton(text: message.content)
                             }
                             if !model.isGenerating {
                                 Button {
                                     draft = message.content
                                     editing = true
                                 } label: { Label("Edit", systemImage: "pencil").font(.caption2) }
-                                .buttonStyle(.borderless)
-                                .foregroundStyle(.secondary)
+                                .buttonStyle(.hoverPress)
                                 .help("Change this message and ask again from here")
+                                deleteButton
                             }
                         }
                     }
@@ -122,9 +117,7 @@ struct MessageRow: View {
                     ThinkingView(messageID: message.id, text: thinking, isStreaming: message.isStreaming && message.content.isEmpty)
                 }
                 if !message.content.isEmpty {
-                    MarkdownView(text: message.content) { command in
-                        model.send(text: command, attachments: [])
-                    }
+                    MarkdownView(text: message.content, selectable: !message.isStreaming)
                 }
                 ForEach(message.toolCalls) { call in
                     ToolCallCard(call: call, messageID: message.id)
@@ -144,6 +137,9 @@ struct MessageRow: View {
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
                 }
+                if let note = message.note {
+                    Text(note).font(.caption).italic().foregroundStyle(.secondary)
+                }
                 footer
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -162,9 +158,11 @@ struct MessageRow: View {
     private var footer: some View {
         HStack(spacing: 12) {
             if message.stopped {
-                Label("Stopped · partial reply", systemImage: "stop.fill")
+                Label("Stopped · " + (message.stopReason ?? "partial reply"), systemImage: "stop.fill")
                     .font(.caption2).foregroundStyle(.orange)
-                    .help("You stopped this reply before the model finished. What is shown is everything it produced.")
+                    .help(message.stopReason == nil
+                          ? "You stopped this reply before the model finished. What is shown is everything it produced."
+                          : "Roger stopped this reply: \(message.stopReason!). What is shown is everything the model produced before that.")
             }
             if message.answeredInReasoning {
                 Label("Answered in its reasoning", systemImage: "brain")
@@ -181,25 +179,35 @@ struct MessageRow: View {
                 Text(stats).font(.caption2).foregroundStyle(.tertiary)
             }
             if hovering && !message.content.isEmpty {
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(message.content, forType: .string)
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc").font(.caption2)
+                CopyButton(text: message.content)
+            }
+            if isLast && message.canResume && !model.isGenerating {
+                Button { model.resumeLast() } label: {
+                    Label("Resume", systemImage: "play.fill").font(.caption2)
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
+                .buttonStyle(.hoverPress)
+                .help("Continue this reply from where it was stopped")
             }
             if isLast && !message.isStreaming && !model.isGenerating {
                 Button { model.regenerateLast() } label: {
                     Label("Regenerate", systemImage: "arrow.clockwise").font(.caption2)
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
+                .buttonStyle(.hoverPress)
                 .help("Discard this reply and generate a new one")
+            }
+            if hovering && !message.isStreaming && !model.isGenerating && message.role != .tool {
+                deleteButton
             }
         }
         .frame(height: 14)
+    }
+
+    private var deleteButton: some View {
+        Button(role: .destructive) { model.deleteMessage(message.id) } label: {
+            Label("Delete", systemImage: "trash").font(.caption2)
+        }
+        .buttonStyle(.hoverPress)
+        .help("Remove this message from the chat so it no longer takes up context")
     }
 
     private var modelTooltip: String {
@@ -233,11 +241,9 @@ struct ThinkingView: View {
                 }
             }
             if expanded {
-                Text(text)
+                MarkdownView(text: text, selectable: !isStreaming, compact: true)
                     .font(.callout)
-                    .italic()
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
                     .padding(.leading, 18)
                     .padding(.trailing, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -286,4 +292,60 @@ struct AttachmentChip: View {
             }.value
         }
     }
+}
+
+/// Copies text to the clipboard and reads "Copied" for a moment, so the click is confirmed.
+struct CopyButton: View {
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
+        } label: {
+            Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                .font(.caption2)
+        }
+        .buttonStyle(.hoverPress)
+        .help("Copy the message text")
+    }
+}
+
+/// Style for the small actions around a message (Copy, Edit, Regenerate, code block
+/// buttons). The label is dimmed until the pointer is over it, gets a tinted background on
+/// hover and a darker one while pressed, so a click is visibly registered.
+struct HoverPressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Styled(configuration: configuration)
+    }
+
+    private struct Styled: View {
+        let configuration: Configuration
+        @State private var hovering = false
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            let active = hovering || configuration.isPressed
+            configuration.label
+                .foregroundStyle(active ? .primary : .secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.primary.opacity(configuration.isPressed ? 0.16 : hovering ? 0.07 : 0))
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .opacity(isEnabled ? 1 : 0.4)
+                .onHover { hovering = $0 }
+                .animation(.easeOut(duration: 0.1), value: hovering)
+                .animation(.easeOut(duration: 0.05), value: configuration.isPressed)
+        }
+    }
+}
+
+extension ButtonStyle where Self == HoverPressButtonStyle {
+    static var hoverPress: HoverPressButtonStyle { HoverPressButtonStyle() }
 }

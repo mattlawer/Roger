@@ -36,7 +36,7 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .safeAreaInset(edge: .top, spacing: 0) { searchField }
+        .safeAreaInset(edge: .top, spacing: 0) { topBar }
         .safeAreaInset(edge: .bottom) { statusFooter }
         .onChange(of: model.searchFocusRequest) { _, _ in searchFocused = true }
         .alert("Rename chat", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
@@ -80,6 +80,9 @@ struct SidebarView: View {
             model.generateTitle(for: convo.id, force: true)
         }
         .disabled(model.generatingTitleIDs.contains(convo.id) || !convo.messages.contains { $0.role == .assistant && !$0.content.isEmpty })
+        Divider()
+        Button("Duplicate") { model.duplicateConversation(convo.id) }
+        Button("New Chat With Same Model and Folder") { model.newConversation(like: convo.id) }
         Menu("Move to") {
             Button("No group") { model.moveConversation(convo.id, toGroup: nil) }
                 .disabled(convo.groupID == nil)
@@ -176,7 +179,26 @@ struct SidebarView: View {
                 }
             }
         } icon: {
-            Image(systemName: convo.id == model.selectedID && model.isGenerating ? "ellipsis.bubble" : "bubble.left")
+            Image(systemName: model.isGenerating(in: convo.id) ? "ellipsis.bubble" : "bubble.left")
+        }
+    }
+
+    // MARK: - Top bar
+
+    /// New chat and new group above the search field.
+    private var topBar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Button { model.newConversation() } label: {
+                    Label("New Chat", systemImage: "square.and.pencil").frame(maxWidth: .infinity)
+                }
+                .help("New chat in the current group (⌘N)")
+                Button { model.newGroupRequest = NewGroupRequest() } label: { Image(systemName: "folder.badge.plus") }
+                    .help("New group (⇧⌘N)")
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            searchField
         }
     }
 
@@ -251,9 +273,6 @@ struct SidebarView: View {
                     Text(statusDetail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
-                Button { model.newGroupRequest = NewGroupRequest() } label: { Image(systemName: "folder.badge.plus") }
-                    .buttonStyle(.borderless)
-                    .help("New group (⇧⌘N)")
                 Button { Task { await model.refreshStatus() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
                     .help("Reconnect")

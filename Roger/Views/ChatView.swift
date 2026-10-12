@@ -11,54 +11,78 @@ struct ChatView: View {
     @State private var userScrolling = false
     /// While a freshly opened chat settles at the bottom, geometry readings are transient.
     @State private var settlingUntil = Date.distantPast
+    /// While one of our animated scrolls is in flight. Content that grows faster than the
+    /// animation moves (a reply starting right after the user's message) reads as distance
+    /// from the bottom; in that window only a reported gesture counts as the reader leaving.
+    @State private var ownScrollUntil = Date.distantPast
+    /// Time of the last scroll-wheel event in the window (trackpad or mouse). Legacy mouse
+    /// wheels report no scroll phases, so this is how their scrolls are told apart from ours.
+    @State private var lastWheelEvent = Date.distantPast
+    @State private var wheelMonitor: Any?
+    /// Bumped when the view is found past the end of the content, to scroll back to the bottom.
+    @State private var bottomRequest = 0
     // macOS 14 fallback measurements (see legacy probes below).
     @State private var legacyViewportHeight: CGFloat = 0
     @State private var legacyContentBottom: CGFloat = 0
 
     /// Distance from the bottom under which the view counts as "at the bottom".
     private static let followThreshold: CGFloat = 120
-    /// Offset the reader must move away from the bottom (per geometry event) to stop following.
-    private static let leaveThreshold: CGFloat = 6
+    /// Offset the reader must move away from the bottom (per geometry event) to stop following
+    /// when no wheel, trackpad or scroll phase explains the move: a scrollbar drag. Content
+    /// laid out after one of our scrolls can move the offset by less than this on its own.
+    private static let leaveThreshold: CGFloat = 48
     /// Distance from the bottom beyond which the pill is offered once following stopped.
     private static let pillThreshold: CGFloat = 40
 
-    private var messages: [ChatMessage] {
-        (model.selected?.messages ?? []).filter { $0.role == .user || $0.role == .assistant }
+    /// What the body derives from the conversation. Computed once per evaluation, since the
+    /// body runs on every refresh of a streaming reply and the context plan walks every message.
+    private struct Derived {
+        var messages: [ChatMessage]
+        var plan: ContextPlan?
+        /// First message still sent to the model, when older ones are trimmed.
+        var trimBoundaryID: UUID?
+        var trimmedVisibleCount: Int
     }
 
-    private var plan: ContextPlan? { model.selected.map(model.contextPlan(for:)) }
-
-    /// First message still sent to the model, when older ones are trimmed.
-    private var trimBoundaryID: UUID? {
-        guard let convo = model.selected, let plan, plan.trimmedCount > 0,
-              plan.firstSentIndex < convo.messages.count else { return nil }
-        return convo.messages[plan.firstSentIndex].id
-    }
-
-    private var trimmedVisibleCount: Int {
-        guard let convo = model.selected, let plan, plan.trimmedCount > 0 else { return 0 }
-        return convo.messages[..<plan.firstSentIndex].filter { $0.role == .user || $0.role == .assistant }.count
+    private var derived: Derived {
+        let convo = model.selected
+        let all = convo?.messages ?? []
+        let messages = all.filter { $0.role == .user || $0.role == .assistant }
+        let plan = convo.map { model.contextPlan(for: $0) }
+        var boundary: UUID?
+        var trimmed = 0
+        if let plan, plan.trimmedCount > 0, plan.firstSentIndex <= all.count {
+            if plan.firstSentIndex < all.count { boundary = all[plan.firstSentIndex].id }
+            trimmed = all[..<plan.firstSentIndex].filter { $0.role == .user || $0.role == .assistant }.count
+        }
+        return Derived(messages: messages, plan: plan, trimBoundaryID: boundary, trimmedVisibleCount: trimmed)
     }
 
     /// Changes whenever the last message grows, so the view can follow streaming output.
-    private var scrollKey: String {
+    /// Byte counts, because counting characters walks the whole string.
+    private func scrollKey(_ messages: [ChatMessage]) -> String {
         guard let last = messages.last else { return "0" }
         let tools = last.toolCalls.map { $0.status.rawValue + ($0.result == nil ? "" : "r") }.joined(separator: ",")
-        return "\(messages.count)-\(last.content.count)-\(last.thinking?.count ?? 0)-\(tools)-\(last.isStreaming)"
+        return "\(messages.count)-\(last.content.utf8.count)-\(last.thinking?.utf8.count ?? 0)-\(tools)-\(last.isStreaming)"
     }
 
     private var isNearBottom: Bool { distanceFromBottom < Self.followThreshold }
     /// The pill is offered only once the reader has left the bottom; while following, growth
     /// can momentarily read as distance and must not flash it.
-    private var showJump: Bool { !followOutput && distanceFromBottom > Self.pillThreshold && !messages.isEmpty }
+    private func showJump(_ messages: [ChatMessage]) -> Bool {
+        !followOutput && distanceFromBottom > Self.pillThreshold && !messages.isEmpty
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
+        let d = derived
+        let messages = d.messages
+        let lastID = messages.last?.id
+        return VStack(spacing: 0) {
             if case .unreachable = model.status { OllamaBanner() }
             if let name = model.currentModelName, model.modelSupportsTools(name) == false, model.settings.toolsEnabled {
                 InfoBar(text: "\(name) doesn't support tool calling. Roger will answer in text and suggest commands you can run with one click.", systemImage: "info.circle")
             }
-            if let plan, plan.exceedsWindow { contextBanner(plan) }
+            if let plan = d.plan, plan.exceedsWindow { contextBanner(plan, trimmedVisibleCount: d.trimmedVisibleCount) }
             if let name = model.currentModelName, model.modelSupportsVision(name) == false,
                model.selected?.messages.contains(where: { $0.attachments.contains(where: \.isImage) }) == true {
                 InfoBar(text: "\(name) can't look at images, so the images in this chat are left out of what it receives." + (model.visionModels.isEmpty ? "" : " Vision models installed: \(model.visionModels.map(\.name).joined(separator: ", "))."),
@@ -76,11 +100,15 @@ struct ChatView: View {
             }
             ScrollViewReader { proxy in
                 tracked(ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 18) {
+                    // A plain stack: a lazy one keeps stale sizes for rows that shrink (a thinking
+                    // section collapsing), which left an empty zone at the end and sent
+                    // scroll-to-bottom past the content. Rows are cheap to keep around: a message's
+                    // Markdown is rendered once and skipped while its text is unchanged.
+                    VStack(alignment: .leading, spacing: 18) {
                         if messages.isEmpty { welcome }
                         ForEach(messages) { message in
-                            if message.id == trimBoundaryID { TrimDivider(count: trimmedVisibleCount) }
-                            MessageRow(message: message, isLast: message.id == messages.last?.id && message.role == .assistant)
+                            if message.id == d.trimBoundaryID { TrimDivider(count: d.trimmedVisibleCount) }
+                            MessageRow(message: message, isLast: message.id == lastID && message.role == .assistant)
                                 .id(message.id)
                         }
                         Color.clear.frame(height: 1).id("bottom")
@@ -95,16 +123,20 @@ struct ChatView: View {
                 .background(legacyViewportProbe)
                 .defaultScrollAnchor(.bottom)
                 .overlay(alignment: .bottom) {
-                    if showJump {
+                    if showJump(messages) {
                         JumpToLatestButton(live: model.isGenerating) { resumeFollowing(proxy, animated: true) }
                             .padding(.bottom, 12)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
-                .animation(.easeOut(duration: 0.18), value: showJump)
-                .onChange(of: scrollKey) { _, _ in
+                .animation(.easeOut(duration: 0.18), value: showJump(messages))
+                .onChange(of: scrollKey(messages)) { _, _ in
                     // New output: follow it only while the reader wants to be at the bottom.
                     if followOutput { scrollToBottom(proxy, animated: false) }
+                }
+                .onChange(of: bottomRequest) { _, _ in
+                    // Content shrank under the reader: the view sat past its end.
+                    proxy.scrollTo("bottom", anchor: .bottom)
                 }
                 .onChange(of: messages.last?.role == .user ? messages.count : -1) { _, _ in
                     // A message the user just sent is always brought into view.
@@ -125,6 +157,17 @@ struct ChatView: View {
             ComposerView()
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .onAppear {
+            guard wheelMonitor == nil else { return }
+            wheelMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+                lastWheelEvent = Date()
+                return event
+            }
+        }
+        .onDisappear {
+            if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor) }
+            wheelMonitor = nil
+        }
         .task(id: model.currentModelName) {
             // Learn the model's real context limit so the budget meter can cap the Settings value.
             if let name = model.currentModelName { await model.loadStats(for: name) }
@@ -136,6 +179,10 @@ struct ChatView: View {
     private struct ScrollSnapshot: Equatable {
         var offset: CGFloat
         var distance: CGFloat
+        /// How far the visible area extends past the end of the content once the content is
+        /// taller than the view: content shrank under the reader (the thinking section
+        /// collapsing when a reply ends, for instance) and the view must be pulled back.
+        var overshoot: CGFloat
     }
 
     /// Observes the scroll view's geometry. On macOS 15 this uses the dedicated API; a change
@@ -146,9 +193,17 @@ struct ChatView: View {
         if #available(macOS 15.0, *) {
             scrollView
                 .onScrollGeometryChange(for: ScrollSnapshot.self) { geo in
-                    ScrollSnapshot(offset: geo.contentOffset.y, distance: max(0, geo.contentSize.height - geo.visibleRect.maxY))
+                    let tallerThanView = geo.contentSize.height > geo.visibleRect.height
+                    return ScrollSnapshot(offset: geo.contentOffset.y,
+                                          distance: max(0, geo.contentSize.height - geo.visibleRect.maxY),
+                                          overshoot: tallerThanView ? max(0, geo.visibleRect.maxY - geo.contentSize.height) : 0)
                 } action: { old, new in
                     scrollChanged(offsetMoved: old.offset != new.offset, distance: new.distance)
+                    // Past the end of the content while nobody is scrolling: content shrank
+                    // under the reader. The elastic bounce of a scroll gesture also overshoots
+                    // and must be left alone, or the view fights the reader's hand.
+                    let readerScrolling = userScrolling || Date().timeIntervalSince(lastWheelEvent) < 0.6
+                    if new.overshoot > 1, followOutput, !readerScrolling, Date() > settlingUntil { bottomRequest += 1 }
                 }
                 .onScrollPhaseChange { _, phase in
                     // Trackpad gestures report phases; legacy mouse wheels do not, so this is
@@ -199,9 +254,10 @@ struct ChatView: View {
         if abs(distance - previous) > 0.5 { distanceFromBottom = distance }
         // Content growth leaves the offset alone and never changes the decision to follow.
         guard offsetMoved, Date() > settlingUntil else { return }
-        if distance > previous + (userScrolling ? 0.5 : Self.leaveThreshold) {
+        let byReader = userScrolling || Date().timeIntervalSince(lastWheelEvent) < 0.4
+        if distance > previous + (byReader ? 0.5 : Self.leaveThreshold) {
             // Moved away from the bottom: only the reader does that; our scrolls go toward it.
-            followOutput = false
+            if byReader || Date() > ownScrollUntil { followOutput = false }
         } else if distance < Self.followThreshold && distance <= previous + 0.5 {
             // Arrived (back) at the bottom.
             followOutput = true
@@ -210,6 +266,7 @@ struct ChatView: View {
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
         if animated {
+            ownScrollUntil = Date().addingTimeInterval(0.6)
             withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
         } else {
             proxy.scrollTo("bottom", anchor: .bottom)
@@ -240,7 +297,7 @@ struct ChatView: View {
         }
     }
 
-    private func contextBanner(_ plan: ContextPlan) -> some View {
+    private func contextBanner(_ plan: ContextPlan, trimmedVisibleCount: Int) -> some View {
         let name = model.currentModelName ?? "the model"
         let window = TokenEstimator.format(plan.window)
         let text: String

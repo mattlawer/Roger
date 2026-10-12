@@ -36,8 +36,16 @@ final class AppModel {
     var modelStats: [String: ModelStats] = [:]
     var loadingStats: Set<String> = []
     var status: OllamaStatus = .unknown
-    var isGenerating = false
-    var pendingApprovalID: UUID?
+    /// Chats with a reply in progress. Several can run at once, on the same or different models.
+    var generatingIDs: Set<UUID> = []
+    /// Whether the selected chat has a reply in progress.
+    var isGenerating: Bool { selectedID.map { generatingIDs.contains($0) } ?? false }
+    /// Whether any chat has a reply in progress (benchmarks and trials need the GPU to themselves).
+    var isAnyGenerating: Bool { !generatingIDs.isEmpty }
+    func isGenerating(in conversationID: UUID) -> Bool { generatingIDs.contains(conversationID) }
+    /// Tool calls waiting for the user's decision, by call id.
+    var pendingApprovalIDs: Set<UUID> = []
+    func isApprovalPending(_ callID: UUID) -> Bool { pendingApprovalIDs.contains(callID) }
     var showModelsSheet = false
     var isPulling = false
     var pullingName = ""
@@ -45,6 +53,19 @@ final class AppModel {
     var pullError: String?
     var errorBanner: String?
     var isStartingOllama = false
+    /// Every benchmark run on this Mac, newest first.
+    var benchmarkHistory: [ModelBenchmark] = []
+    /// The latest run for each model.
+    var benchmarks: [String: ModelBenchmark] {
+        var latest: [String: ModelBenchmark] = [:]
+        for run in benchmarkHistory where latest[run.model] == nil { latest[run.model] = run }
+        return latest
+    }
+    /// Model being benchmarked right now, the step it is on, and the models still queued.
+    var benchmarkingModel: String?
+    var benchmarkStep = ""
+    var benchmarkQueue: [String] = []
+    var benchmarkError: String?
     /// Sidebar search. Filters the chat list and highlights matching messages.
     var searchQuery = ""
     /// Bumped by ⌘F so the sidebar can move focus to the search field.
@@ -65,9 +86,11 @@ final class AppModel {
     var toolRunCount = 0
 
     private let store = ConversationStore()
-    private var generationTask: Task<Void, Never>?
+    private var generationTasks: [UUID: Task<Void, Never>] = [:]
     private var pullTask: Task<Void, Never>?
-    private var approvalContinuation: CheckedContinuation<ApprovalDecision, Never>?
+    private var benchmarkTask: Task<Void, Never>?
+    private let benchmarkStore = BenchmarkStore()
+    private var pendingApprovals: [UUID: (conversationID: UUID, continuation: CheckedContinuation<ApprovalDecision, Never>)] = [:]
     private var modelsWithoutTools: Set<String> = []
 
     private var client: OllamaClient { OllamaClient(baseURL: settings.hostURL) }
@@ -162,6 +185,7 @@ final class AppModel {
     func bootstrap() async {
         conversations = store.loadAll()
         groups = store.loadGroups()
+        benchmarkHistory = benchmarkStore.load()
         let valid = Set(groups.map(\.id))
         for c in conversations where c.groupID != nil && !valid.contains(c.groupID!) {
             update(c.id) { $0.groupID = nil }
@@ -169,6 +193,10 @@ final class AppModel {
         if conversations.isEmpty { newConversation() } else { selectedID = sortedConversations.first?.id }
         await refreshStatus()
         await refreshWebStatus()
+        if let list = Self.launchArgument("--try-models") {
+            showModelsSheet = true
+            tryModels(list.split(whereSeparator: { $0 == "," || $0 == " " }).map(String.init))
+        }
     }
 
     // MARK: - Web status
@@ -248,7 +276,7 @@ final class AppModel {
 
     func refreshModels() async {
         do {
-            models = try await client.listModels()
+            models = Self.visibleModels(try await client.listModels())
             runningModels = (try? await client.runningModels()) ?? []
             let names = Set(models.map(\.name))
             modelStats = modelStats.filter { names.contains($0.key) }
@@ -290,8 +318,36 @@ final class AppModel {
         return c
     }
 
+    /// A new, empty chat with the same model, working directory and group as another.
+    func newConversation(like id: UUID) {
+        guard let source = conversation(id) else { return }
+        let c = newConversation(in: .some(source.groupID))
+        update(c.id) { $0.model = source.model; $0.workingDirectory = source.workingDirectory }
+    }
+
+    /// A copy of a chat, messages included, with the same model, working directory and
+    /// group. Messages and tool calls get fresh identities so the copy is independent.
+    func duplicateConversation(_ id: UUID) {
+        guard let source = conversation(id) else { return }
+        var copy = source
+        copy.id = UUID()
+        copy.title = source.title + " copy"
+        copy.createdAt = Date()
+        copy.updatedAt = Date()
+        copy.messages = source.messages.map { message in
+            var m = message
+            m.id = UUID()
+            m.isStreaming = false
+            m.toolCalls = m.toolCalls.map { var call = $0; call.id = UUID(); return call }
+            return m
+        }
+        conversations.insert(copy, at: 0)
+        store.save(copy)
+        selectedID = copy.id
+    }
+
     func deleteConversation(_ id: UUID) {
-        if id == selectedID, isGenerating { stopGeneration() }
+        stopGeneration(in: id)
         conversations.removeAll { $0.id == id }
         store.delete(id)
         if selectedID == id { selectedID = sortedConversations.first?.id }
@@ -383,7 +439,7 @@ final class AppModel {
             ["role": "user", "content": prompt],
         ]
         Task { [weak self] in
-            let raw = (try? await client.chatOnce(model: modelName, messages: messages, options: options, think: think)) ?? ""
+            let raw = (try? await client.chatOnce(model: modelName, messages: messages, options: options, think: think, keepAlive: settings.keepAlive)) ?? ""
             guard let self else { return }
             self.generatingTitleIDs.remove(convoID)
             guard let title = Self.cleanTitle(raw), let current = self.conversation(convoID), !current.titleIsCustom else { return }
@@ -427,7 +483,7 @@ final class AppModel {
 
     func clearMessages() {
         guard let id = selectedID else { return }
-        if isGenerating { stopGeneration() }
+        stopGeneration(in: id)
         update(id) { $0.messages = []; $0.title = "New chat" }
     }
 
@@ -474,8 +530,12 @@ final class AppModel {
 
     func send(text: String, attachments: [Attachment]) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isGenerating, !(trimmed.isEmpty && attachments.isEmpty) else { return }
-        guard let convoID = selectedID, let convo = conversation(convoID) else { return }
+        guard !(trimmed.isEmpty && attachments.isEmpty) else { return }
+        guard !isBenchmarking else {
+            errorBanner = "A model benchmark is running. Wait for it to finish, or cancel it in the Models window."
+            return
+        }
+        guard let convoID = selectedID, let convo = conversation(convoID), !isGenerating(in: convoID) else { return }
         guard let modelName = convo.model ?? defaultModelName else {
             errorBanner = "No model available. Install one from the Models window."
             return
@@ -495,13 +555,29 @@ final class AppModel {
     /// Removes the last assistant turn (and any tool messages after the last user message)
     /// and regenerates a fresh response to the same prompt.
     func regenerateLast() {
-        guard !isGenerating, let convoID = selectedID, let convo = conversation(convoID),
+        guard let convoID = selectedID, !isGenerating(in: convoID), let convo = conversation(convoID),
               let modelName = convo.model ?? defaultModelName else { return }
         guard let lastUser = convo.messages.lastIndex(where: { $0.role == .user }) else { return }
         guard let idx = conversations.firstIndex(where: { $0.id == convoID }) else { return }
         conversations[idx].messages.removeSubrange((lastUser + 1)...)
         persist(convoID)
         startGeneration(conversationID: convoID, model: modelName)
+    }
+
+    /// Removes one message from the selected chat so it no longer takes up context. The
+    /// tool results that answered an assistant message's calls go with it, so the model
+    /// never sees a result without its call.
+    func deleteMessage(_ messageID: UUID) {
+        guard let convoID = selectedID, !isGenerating(in: convoID), let convo = conversation(convoID),
+              let index = convo.messages.firstIndex(where: { $0.id == messageID }) else { return }
+        var ids: Set<UUID> = [messageID]
+        if convo.messages[index].role == .assistant {
+            for m in convo.messages[(index + 1)...] {
+                guard m.role == .tool else { break }
+                ids.insert(m.id)
+            }
+        }
+        update(convoID) { $0.messages.removeAll { ids.contains($0.id) } }
     }
 
     /// Number of messages that would be discarded by editing and resending `messageID`.
@@ -514,7 +590,7 @@ final class AppModel {
     /// asks the model again from that point. Attachments on the message are kept.
     func editAndResend(messageID: UUID, text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isGenerating, let convoID = selectedID, let convo = conversation(convoID),
+        guard let convoID = selectedID, !isGenerating(in: convoID), let convo = conversation(convoID),
               let idx = conversations.firstIndex(where: { $0.id == convoID }),
               let midx = convo.messages.firstIndex(where: { $0.id == messageID }),
               convo.messages[midx].role == .user else { return }
@@ -534,64 +610,110 @@ final class AppModel {
         startGeneration(conversationID: convoID, model: modelName)
     }
 
-    private func startGeneration(conversationID convoID: UUID, model modelName: String) {
+    /// Continues the last reply where it was stopped: the model is handed its partial text
+    /// and carries on from there. Only for a reply the user stopped that has visible text and
+    /// no tool calls; a reply stopped for repeating itself is better regenerated.
+    func resumeLast() {
+        guard let convoID = selectedID, !isGenerating(in: convoID), let convo = conversation(convoID),
+              let modelName = convo.model ?? defaultModelName,
+              let last = convo.messages.last, last.canResume else { return }
+        startGeneration(conversationID: convoID, model: modelName, resuming: last.id)
+    }
+
+    private func startGeneration(conversationID convoID: UUID, model modelName: String, resuming: UUID? = nil) {
         errorBanner = nil
-        isGenerating = true
-        generationTask = Task { [weak self] in
+        generatingIDs.insert(convoID)
+        generationTasks[convoID] = Task { [weak self] in
             guard let self else { return }
-            await self.runAgentLoop(conversationID: convoID, model: modelName)
-            self.isGenerating = false
-            self.generationTask = nil
-            self.pendingApprovalID = nil
+            await self.runAgentLoop(conversationID: convoID, model: modelName, resuming: resuming)
+            self.generatingIDs.remove(convoID)
+            self.generationTasks[convoID] = nil
             self.generateTitle(for: convoID)
         }
     }
 
-    /// Stops the current reply but keeps whatever the model has produced so far.
+    /// Stops the reply in progress in the selected chat, keeping whatever the model produced.
     func stopGeneration() {
-        generationTask?.cancel()
-        if approvalContinuation != nil { resolveApproval(.deny) }
+        if let id = selectedID { stopGeneration(in: id) }
+    }
+
+    func stopGeneration(in conversationID: UUID) {
+        generationTasks[conversationID]?.cancel()
+        for (callID, pending) in pendingApprovals where pending.conversationID == conversationID {
+            resolveApproval(.deny, for: callID)
+        }
     }
 
     // MARK: - Approvals
 
-    private func awaitApproval(for callID: UUID) async -> ApprovalDecision {
+    private func awaitApproval(for callID: UUID, in conversationID: UUID) async -> ApprovalDecision {
         await withCheckedContinuation { continuation in
-            approvalContinuation = continuation
-            pendingApprovalID = callID
+            pendingApprovals[callID] = (conversationID, continuation)
+            pendingApprovalIDs.insert(callID)
         }
     }
 
-    func resolveApproval(_ decision: ApprovalDecision) {
-        pendingApprovalID = nil
-        let c = approvalContinuation
-        approvalContinuation = nil
-        c?.resume(returning: decision)
+    func resolveApproval(_ decision: ApprovalDecision, for callID: UUID) {
+        guard let pending = pendingApprovals.removeValue(forKey: callID) else { return }
+        pendingApprovalIDs.remove(callID)
+        pending.continuation.resume(returning: decision)
     }
 
     // MARK: - Agent loop
 
-    private func runAgentLoop(conversationID: UUID, model: String) async {
+    /// How often a streaming reply is written to its message, and so redrawn. Tokens arrive
+    /// far faster than the window can be redrawn, and every write re-evaluates the sidebar,
+    /// the chat and the composer; writing once per token kept the main thread saturated.
+    private static let streamRefreshInterval: Duration = .milliseconds(50)
+
+    private func runAgentLoop(conversationID: UUID, model: String, resuming: UUID? = nil) async {
         let client = self.client
         var useTools = settings.toolsEnabled && modelSupportsTools(model) != false
         var iterations = 0
         let maxIterations = max(1, settings.maxToolIterations)
+        // Calls already made this turn, with their results, so a model that asks for the
+        // very same thing again is reminded instead of fed the same answer for ever.
+        // Cleared whenever a tool changes files or runs a command, because repeating a
+        // read, a search or a build after that is legitimate.
+        var seenCalls: [RepeatedCallKey: (count: Int, result: String)] = [:]
+        // A reply that fell into a loop is discarded and asked for once more with sampling
+        // that discourages repeats; a second loop is stopped for good.
+        var retriedAfterLoop = false
 
         while iterations < maxIterations {
             iterations += 1
             guard let convo = conversation(conversationID) else { return }
-            let assistantID = UUID()
-            appendMessage(ChatMessage(id: assistantID, role: .assistant, content: "", isStreaming: true, model: model), to: conversationID)
+            // Resuming: the stopped reply is reopened and sent to the model as the last
+            // message, so it continues the text instead of starting over.
+            let resumed = iterations == 1 ? resuming.flatMap { id in convo.messages.first { $0.id == id } } : nil
+            let assistantID = resumed?.id ?? UUID()
+            if resumed != nil {
+                updateMessage(assistantID, in: conversationID) {
+                    $0.isStreaming = true; $0.stopped = false; $0.stopReason = nil; $0.stats = nil; $0.error = nil
+                }
+            } else {
+                appendMessage(ChatMessage(id: assistantID, role: .assistant, content: "", isStreaming: true, model: model), to: conversationID)
+            }
 
             let apiMessages = buildAPIMessages(for: convo, tools: useTools)
-            let options: [String: Any] = ["temperature": settings.temperature, "num_ctx": settings.contextLength]
+            var options: [String: Any] = ["temperature": settings.temperature, "num_ctx": settings.contextLength]
+            if retriedAfterLoop {
+                // Repeated tokens are penalised over a long window and the temperature is
+                // raised a little, so the same cycle is unlikely to form again.
+                options["repeat_penalty"] = 1.2
+                options["repeat_last_n"] = 512
+                options["temperature"] = max(settings.temperature, 0.7)
+                updateMessage(assistantID, in: conversationID) { $0.note = "Retried with a repetition penalty after the model started looping." }
+            }
             var collected: [ToolCall] = []
             var stats: String?
             var receivedChunks = 0
             var reportedModel = false
-            var rawContent = ""
-            var apiThinking = ""
-            let think: Bool? = (settings.reasoningMode == .off && modelInfo(model)?.supportsThinking == true) ? false : nil
+            var rawContent = resumed?.content ?? ""
+            var apiThinking = resumed?.thinking ?? ""
+            // Asked for explicitly: some runners (Gemma 4 on MLX, for one) only think when
+            // told to, and leave the thought out otherwise.
+            let think: Bool? = modelInfo(model)?.supportsThinking == true ? (settings.reasoningMode != .off) : nil
 
             // Some models (older DeepSeek-R1 builds, for instance) put their reasoning in
             // <think> tags inside the content instead of Ollama's separate field. Keep both
@@ -605,8 +727,53 @@ final class AppModel {
                 }
             }
 
+            // The text is collected as it streams and shown at a bounded rate. Text that
+            // arrives just before a pause is shown by a short trailing refresh; the end of
+            // the stream, a stop and an error flush whatever is left.
+            var lastRefresh = ContinuousClock.now - Self.streamRefreshInterval
+            var trailingRefresh: Task<Void, Never>?
+            func refreshText() {
+                let now = ContinuousClock.now
+                let sinceLast = now - lastRefresh
+                if sinceLast >= Self.streamRefreshInterval {
+                    trailingRefresh?.cancel()
+                    trailingRefresh = nil
+                    lastRefresh = now
+                    applyText()
+                } else if trailingRefresh == nil {
+                    let delay = Self.streamRefreshInterval - sinceLast
+                    trailingRefresh = Task {
+                        try? await Task.sleep(for: delay)
+                        guard !Task.isCancelled else { return }
+                        trailingRefresh = nil
+                        lastRefresh = ContinuousClock.now
+                        applyText()
+                    }
+                }
+            }
+            func flushText() {
+                trailingRefresh?.cancel()
+                trailingRefresh = nil
+                applyText()
+            }
+
+            // A model that starts repeating itself (a few lines over and over, usually while
+            // thinking) never finishes on its own; it is stopped once the loop is certain.
+            var repeating = false
+            var outgrown = false
+            var checkedLength = rawContent.utf8.count + apiThinking.utf8.count
+            let replyByteCap = contextWindow(for: model) * TokenEstimator.bytesPerToken
+            func checkForLoop() {
+                let length = apiThinking.utf8.count + rawContent.utf8.count
+                guard length - checkedLength >= 200 else { return }
+                checkedLength = length
+                repeating = [apiThinking, rawContent].contains { Self.endsInRepetition($0) || Self.endsInRepeatedLines($0) }
+                // A single reply longer than the whole context window is not going to end well.
+                outgrown = length > replyByteCap
+            }
+
             do {
-                let stream = client.chat(model: model, messages: apiMessages, tools: useTools ? ToolRegistry.definitions(internet: settings.internetEnabled) : nil, options: options, think: think)
+                let stream = client.chat(model: model, messages: apiMessages, tools: useTools ? ToolRegistry.definitions(internet: settings.internetEnabled) : nil, options: options, think: think, keepAlive: settings.keepAlive)
                 for try await chunk in stream {
                     if Task.isCancelled { break }
                     if !reportedModel, let name = chunk.model, !name.isEmpty {
@@ -617,12 +784,14 @@ final class AppModel {
                         if let c = msg.content, !c.isEmpty {
                             receivedChunks += 1
                             rawContent += c
-                            applyText()
+                            refreshText()
                         }
                         if let t = msg.thinking, !t.isEmpty {
                             apiThinking += t
-                            applyText()
+                            refreshText()
                         }
+                        checkForLoop()
+                        if repeating || outgrown { break }
                         if let calls = msg.toolCalls {
                             for raw in calls {
                                 collected.append(ToolCall(name: raw.function.name, arguments: raw.function.arguments?.objectValue ?? [:], callID: raw.id))
@@ -640,10 +809,30 @@ final class AppModel {
                         }
                     }
                 }
+                flushText()
+                if repeating || outgrown {
+                    if repeating, !retriedAfterLoop, resumed == nil, collected.isEmpty {
+                        retriedAfterLoop = true
+                        removeMessage(assistantID, in: conversationID)
+                        iterations -= 1
+                        continue
+                    }
+                    if repeating {
+                        // A few copies of the repeated block tell the story; the wall does not.
+                        apiThinking = Self.trimmingRepetition(apiThinking)
+                        rawContent = Self.trimmingRepetition(rawContent)
+                        flushText()
+                    }
+                    finish(assistantID, in: conversationID, stats: stats, stopped: true, receivedChunks: receivedChunks,
+                           reason: repeating ? "the model kept repeating itself" : "the reply outgrew the context window")
+                    return
+                }
             } catch is CancellationError {
+                flushText()
                 finish(assistantID, in: conversationID, stats: stats, stopped: true, receivedChunks: receivedChunks)
                 return
             } catch {
+                flushText()
                 if useTools, (error as? OllamaError)?.isToolsUnsupported == true {
                     modelsWithoutTools.insert(model)
                     useTools = false
@@ -676,10 +865,52 @@ final class AppModel {
             }
 
             let cwd = convo.workingDirectory
-            for call in collected {
+            var stuckOn: ToolCall?
+            for (index, call) in collected.enumerated() {
                 if Task.isCancelled { break }
-                guard let result = await execute(call, assistantID: assistantID, conversationID: conversationID, cwd: cwd) else { break }
-                appendMessage(ChatMessage(role: .tool, content: result, toolName: call.name, toolCallID: call.callID), to: conversationID)
+                let key = RepeatedCallKey(call)
+                if let seen = seenCalls[key] {
+                    // Exactly this call again. Once: remind the model and repeat the earlier
+                    // result. Twice: stop the loop rather than burn every remaining step.
+                    seenCalls[key] = (seen.count + 1, seen.result)
+                    let thirdTime = seen.count >= 2
+                    updateToolCall(call.id, message: assistantID, in: conversationID) {
+                        $0.status = .skipped
+                        $0.result = thirdTime
+                            ? "Not run: this exact call was already made twice in this turn, so Roger stopped the loop."
+                            : "Not run: identical to an earlier call in this turn. Its result was sent to the model again."
+                    }
+                    let note = thirdTime
+                        ? "Not run: you already called \(call.name) with exactly these arguments twice in this turn and the result does not change. Stop calling tools and answer the user with what you have."
+                        : "You already called \(call.name) with exactly these arguments in this turn, and the result has not changed. Do not call it again with these arguments: use the result below to answer, or call a different tool (for example read_file on a file that a search found). The earlier result is repeated here:\n\n\(seen.result)"
+                    appendMessage(ChatMessage(role: .tool, content: note, toolName: call.name, toolCallID: call.callID), to: conversationID)
+                    if thirdTime {
+                        stuckOn = call
+                        // Calls the model queued after this one are not run either; give
+                        // each a result so the history stays complete.
+                        for rest in collected[(index + 1)...] {
+                            let skippedNote = "Not run: Roger stopped the loop because the previous call kept repeating."
+                            updateToolCall(rest.id, message: assistantID, in: conversationID) { $0.status = .skipped; $0.result = skippedNote }
+                            appendMessage(ChatMessage(role: .tool, content: skippedNote, toolName: rest.name, toolCallID: rest.callID), to: conversationID)
+                        }
+                        break
+                    }
+                    continue
+                }
+                guard let run = await execute(call, assistantID: assistantID, conversationID: conversationID, cwd: cwd) else { break }
+                appendMessage(ChatMessage(role: .tool, content: run.output, toolName: call.name, toolCallID: call.callID), to: conversationID)
+                if run.status != .denied, ToolRegistry.changesState(call.name) {
+                    // Files or the environment may have changed, so earlier reads and
+                    // searches are fair to repeat. This call itself stays recorded, so the
+                    // same edit or command issued again back to back still counts as a repeat.
+                    seenCalls = [:]
+                }
+                seenCalls[key] = (1, run.output)
+            }
+            if let stuck = stuckOn {
+                appendMessage(ChatMessage(role: .assistant, content: "I stopped because the model kept repeating the same `\(stuck.name)` call without using its result. What it found is shown above. Send another message to continue, or try a more capable model."), to: conversationID)
+                persist(conversationID)
+                return
             }
             if Task.isCancelled {
                 // Leave the calls that did run as they are; mark the rest so they don't
@@ -702,6 +933,13 @@ final class AppModel {
     }
 
     private func friendlyError(_ error: Error, model: String) -> String {
+        if let e = error as? OllamaError, e.isRunnerStartTimeout {
+            let bench = benchmarks[model]
+            let mem = bench?.memoryBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .memory) }
+                ?? modelInfo(model)?.sizeDescription
+            let size = mem.map { " (about \($0))" } ?? ""
+            return "Ollama could not load \(model)\(size) in time. On this Mac the model is most likely too large for the free memory and is loading through swap, which also evicts it between steps of a tool loop. Try a smaller model, lower the context length in Settings, or raise \"Keep model loaded\" so it is not reloaded mid-answer. Closing other apps frees memory too."
+        }
         if let e = error as? OllamaError, e.isVisionUnsupported {
             let alternatives = visionModels.map(\.name)
             let hint = alternatives.isEmpty
@@ -712,10 +950,11 @@ final class AppModel {
         return error.localizedDescription
     }
 
-    private func finish(_ assistantID: UUID, in conversationID: UUID, stats: String?, stopped: Bool = false, receivedChunks: Int = 0) {
+    private func finish(_ assistantID: UUID, in conversationID: UUID, stats: String?, stopped: Bool = false, receivedChunks: Int = 0, reason: String? = nil) {
         updateMessage(assistantID, in: conversationID) {
             $0.isStreaming = false
             $0.stopped = stopped
+            $0.stopReason = stopped ? reason : nil
             if stopped {
                 // Ollama only reports counts on the final chunk, which never arrives when
                 // we cancel; each streamed chunk is roughly one token.
@@ -738,16 +977,113 @@ final class AppModel {
         persist(conversationID)
     }
 
-    /// Separates a leading `<think>…</think>` block from the visible reply.
-    static func splitInlineThinking(_ raw: String) -> (thinking: String?, content: String) {
-        let open = "<think>", close = "</think>"
-        let trimmed = raw.drop(while: { $0.isWhitespace || $0.isNewline })
-        guard trimmed.hasPrefix(open) else {
-            // While the first token is still arriving, don't flash "<thi" on screen.
-            if !trimmed.isEmpty, open.hasPrefix(trimmed) { return (nil, "") }
-            return (nil, raw)
+    /// Whether `text` ends in a block of at least `minimumLength` bytes repeated in a row: a
+    /// model that has started looping. A short block must recur many times, `minimumSpan`
+    /// bytes of repetition in all, since re-listing a few items a couple of times is normal
+    /// reasoning; a block of several kilobytes needs only `repeats` copies. Only the last
+    /// `window` bytes are examined, with rolling hashes so a long cycle costs no more than a
+    /// short one. A block of near-identical lines, such as closing braces, is not a loop.
+    nonisolated static func endsInRepetition(_ text: String, minimumLength: Int = 40, repeats: Int = 3, minimumSpan: Int = 1200, window: Int = 64_000) -> Bool {
+        repetition(in: text, minimumLength: minimumLength, repeats: repeats, minimumSpan: minimumSpan, window: window) != nil
+    }
+
+    /// `text` with a repeated tail cut back to `keep` copies of the block.
+    nonisolated static func trimmingRepetition(_ text: String, keep: Int = 3) -> String {
+        guard let run = repetition(in: text), run.copies > keep else { return text }
+        let bytes = Array(text.utf8)
+        return String(decoding: bytes.prefix(bytes.count - (run.copies - keep) * run.period), as: UTF8.self)
+    }
+
+    /// The repeated block `text` ends in (see `endsInRepetition`): its length in bytes and
+    /// how many copies of it the text ends with, or nil when the text does not loop.
+    nonisolated static func repetition(in text: String, minimumLength: Int = 40, repeats: Int = 3, minimumSpan: Int = 1200, window: Int = 64_000) -> (period: Int, copies: Int)? {
+        let bytes = Array(text.utf8.suffix(window))
+        let n = bytes.count
+        guard n >= minimumLength * repeats else { return nil }
+        let base: UInt64 = 1_099_511_628_211
+        var prefix = [UInt64](repeating: 0, count: n + 1)
+        var power = [UInt64](repeating: 1, count: n + 1)
+        for i in 0..<n {
+            prefix[i + 1] = prefix[i] &* base &+ UInt64(bytes[i]) &+ 1
+            power[i + 1] = power[i] &* base
         }
-        let body = trimmed.dropFirst(open.count)
+        func hash(_ from: Int, _ to: Int) -> UInt64 { prefix[to] &- prefix[from] &* power[to - from] }
+        var period = minimumLength
+        while period * repeats <= n {
+            let needed = max(repeats, (minimumSpan + period - 1) / period)
+            guard period * needed <= n else { period += 1; continue }
+            let last = hash(n - period, n)
+            var same = true
+            for r in 1..<needed where hash(n - (r + 1) * period, n - r * period) != last { same = false; break }
+            if same, (0..<period).allSatisfy({ bytes[n - period + $0] == bytes[n - 2 * period + $0] }), hasSubstance(bytes[(n - period)...]) {
+                var copies = needed
+                let block = bytes[(n - period)...]
+                while (copies + 1) * period <= n {
+                    let start = n - (copies + 1) * period
+                    guard bytes[start..<(start + period)].elementsEqual(block) else { break }
+                    copies += 1
+                }
+                return (period, copies)
+            }
+            period += 1
+        }
+        return nil
+    }
+
+    /// A repeated block counts as a loop only if it carries text: a dozen distinct bytes (a
+    /// name such as `get_chain_info(` repeated inside a line has that many, a run of closing
+    /// braces far fewer), and more than one distinct line when it spans several.
+    private nonisolated static func hasSubstance(_ block: ArraySlice<UInt8>) -> Bool {
+        guard Set(block).count >= 12 else { return false }
+        let lines = block.split(separator: UInt8(ascii: "\n")).filter { $0.contains { $0 != UInt8(ascii: " ") } }
+        return lines.count <= 1 || Set(lines.map { Array($0) }).count >= 2
+    }
+
+    /// A looser sign of looping, for a model that rewrites the same long section over and
+    /// over with small changes in between: among the last `recent` lines, at least `distinct`
+    /// different substantial lines have each already appeared `times` times within the last
+    /// `lines` lines.
+    nonisolated static func endsInRepeatedLines(_ text: String, times: Int = 4, distinct: Int = 3, recent: Int = 300, lines: Int = 2000, minimumLength: Int = 30) -> Bool {
+        let all = text.split(separator: "\n", omittingEmptySubsequences: true).suffix(lines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.count >= minimumLength }
+        guard all.count >= times * distinct else { return false }
+        var counts: [String: Int] = [:]
+        for line in all { counts[line, default: 0] += 1 }
+        let repeated = Set(all.suffix(recent).filter { counts[$0, default: 0] >= times })
+        return repeated.count >= distinct
+    }
+
+    /// Separates reasoning the model put inline in its reply from the visible answer.
+    /// Some models wrap it in `<think>…</think>`. Gemma 4 uses a channel, `<|channel>thought`
+    /// … `<channel|>`, and Ollama's MLX runner passes it through as text, sometimes with the
+    /// opening token already consumed so the reply starts with the header line alone
+    /// (`--- type: thought` or `thought`). While the block is still arriving, everything
+    /// after the marker is reasoning and the visible reply is empty.
+    static func splitInlineThinking(_ raw: String) -> (thinking: String?, content: String) {
+        let trimmed = raw.drop(while: { $0.isWhitespace || $0.isNewline })
+        guard !trimmed.isEmpty else { return (nil, raw) }
+        if trimmed.hasPrefix("<think>") {
+            return split(body: trimmed.dropFirst("<think>".count), close: "</think>")
+        }
+        let channelOpen = "<|channel>"
+        if trimmed.hasPrefix(channelOpen) || trimmed.hasPrefix("--- type: thought") || trimmed.hasPrefix("thought\n") {
+            var body = trimmed.hasPrefix(channelOpen) ? trimmed.dropFirst(channelOpen.count) : trimmed
+            // Header lines: "thought", or "--- type: thought" with any further "--- " lines.
+            while let newline = body.firstIndex(of: "\n") {
+                let header = body[..<newline]
+                guard header == "thought" || header.hasPrefix("--- ") else { break }
+                body = body[body.index(after: newline)...]
+            }
+            if body.firstIndex(of: "\n") == nil, body == "thought" || body.hasPrefix("--- ") { return (nil, "") }
+            return split(body: body, close: "<channel|>")
+        }
+        // While the first token is still arriving, don't flash "<thi" or "--- ty" on screen.
+        for marker in ["<think>", channelOpen, "--- type: thought"] where marker.hasPrefix(trimmed) { return (nil, "") }
+        return (nil, raw)
+    }
+
+    private static func split(body: Substring, close: String) -> (thinking: String?, content: String) {
         if let end = body.range(of: close) {
             let thinking = String(body[..<end.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
             let content = String(body[end.upperBound...].drop(while: { $0.isWhitespace || $0.isNewline }))
@@ -763,11 +1099,13 @@ final class AppModel {
         let directory = scope.isFolderScoped ? URL(fileURLWithPath: cwd).standardizedFileURL.path : ""
         let rule = approvals.add(scope, directory: directory)
         updateToolCall(call.id, message: messageID, in: convoID) { $0.approvedBy = rule.title }
-        resolveApproval(.allow)
+        resolveApproval(.allow, for: call.id)
     }
 
     /// Runs one tool call. Returns nil when generation was stopped before the tool ran.
-    private func execute(_ call: ToolCall, assistantID: UUID, conversationID: UUID, cwd: String) async -> String? {
+    /// Runs one tool call (after approval when needed) and returns its output and how it
+    /// ended, or nil when generation was stopped while waiting for approval.
+    private func execute(_ call: ToolCall, assistantID: UUID, conversationID: UUID, cwd: String) async -> (output: String, status: ToolStatus)? {
         let isWeb = ToolRegistry.isWeb(call.name)
         let autoApproved: Bool
         if isWeb {
@@ -786,7 +1124,7 @@ final class AppModel {
         let needsApproval = gated && !allowAllThisSession && !autoApproved && rememberedRule == nil
 
         if needsApproval {
-            let decision = await awaitApproval(for: call.id)
+            let decision = await awaitApproval(for: call.id, in: conversationID)
             if Task.isCancelled {
                 updateToolCall(call.id, message: assistantID, in: conversationID) { $0.status = .cancelled; $0.result = "Not run: generation was stopped." }
                 return nil
@@ -795,7 +1133,7 @@ final class AppModel {
             case .deny:
                 let msg = "The user denied this action. Do not retry it; explain what you wanted to do and ask how to proceed."
                 updateToolCall(call.id, message: assistantID, in: conversationID) { $0.status = .denied; $0.result = msg }
-                return msg
+                return (msg, .denied)
             case .allowAll:
                 allowAllThisSession = true
             case .allow:
@@ -816,7 +1154,23 @@ final class AppModel {
             $0.result = output
         }
         toolRunCount += 1
-        return output
+        return (output, ok ? .done : .failed)
+    }
+
+    /// Identifies a tool call by name and arguments so an identical call issued again in
+    /// the same turn can be recognised. String arguments are trimmed so stray whitespace
+    /// does not disguise a repeat.
+    private struct RepeatedCallKey: Hashable {
+        let name: String
+        let arguments: [String: JSONValue]
+
+        init(_ call: ToolCall) {
+            name = call.name
+            arguments = call.arguments.mapValues { value in
+                if case .string(let s) = value { return .string(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                return value
+            }
+        }
     }
 
     // MARK: - Prompt building
@@ -834,7 +1188,8 @@ final class AppModel {
             \n\nYou have tools to work on the local machine: read_file, write_file, edit_file, list_directory, search_files and run_command. \
             Use them when the user asks about files or wants changes made. Read a file before editing it, and prefer edit_file for small \
             changes over rewriting whole files. Paths may be relative to the working directory. run_command, write_file and edit_file \
-            require the user's approval; if an action is denied, do not retry it. When you identify a fix for a file that already exists in the working directory, apply it with edit_file (or write_file for a new file) instead of only printing the corrected code. After using tools, summarise what you did and what you found.
+            require the user's approval; if an action is denied, do not retry it. Never repeat a tool call with the same arguments: the result \
+            will not change. When search_files or list_directory finds what you are looking for, read it with read_file next. When you identify a fix for a file that already exists in the working directory, apply it with edit_file (or write_file for a new file) instead of only printing the corrected code. If you say you are going to create, write or edit a file, do it in that same turn by calling write_file or edit_file; never end your turn having only described a change you meant to make. After using tools, summarise what you did and what you found.
             """
             if settings.internetEnabled {
                 p += """
@@ -867,11 +1222,29 @@ final class AppModel {
         return configured
     }
 
-    func contextPlan(for convo: Conversation) -> ContextPlan {
+    /// `trimming` overrides the automatic-trimming setting, to see what would be cut even
+    /// when the setting is off.
+    func contextPlan(for convo: Conversation, trimming: Bool? = nil) -> ContextPlan {
         let modelName = convo.model ?? defaultModelName
         let tools = settings.toolsEnabled && (modelName.map { modelSupportsTools($0) != false } ?? false)
         let fixed = TokenEstimator.tokens(forText: systemPrompt(for: convo, tools: tools)) + (tools ? TokenEstimator.toolDefinitionTokens(internet: settings.internetEnabled) : 0)
-        return ContextPlan.plan(messages: convo.messages, fixedTokens: fixed, window: contextWindow(for: modelName), autoTrim: settings.autoTrimContext)
+        return ContextPlan.plan(messages: convo.messages, fixedTokens: fixed, window: contextWindow(for: modelName), autoTrim: trimming ?? settings.autoTrimContext)
+    }
+
+    /// How many of the selected chat's oldest messages no longer fit the model's context
+    /// window: what the scissors would remove.
+    var cuttableMessageCount: Int {
+        guard let convo = selected else { return 0 }
+        return contextPlan(for: convo, trimming: true).trimmedCount
+    }
+
+    /// Removes the selected chat's oldest messages that no longer fit the context window,
+    /// so the chat only holds what the model still sees.
+    func cutTrimmedMessages() {
+        guard let convoID = selectedID, let convo = conversation(convoID) else { return }
+        let count = contextPlan(for: convo, trimming: true).firstSentIndex
+        guard count > 0, count < convo.messages.count else { return }
+        update(convoID) { $0.messages.removeFirst(count) }
     }
 
     private func buildAPIMessages(for convo: Conversation, tools: Bool) -> [[String: Any]] {
@@ -897,7 +1270,7 @@ final class AppModel {
                 out.append(d)
             case .assistant:
                 if m.isStreaming || (m.content.isEmpty && m.toolCalls.isEmpty) { continue }
-                var d: [String: Any] = ["role": "assistant", "content": m.content]
+                var d: [String: Any] = ["role": "assistant", "content": m.apiContent]
                 if !m.toolCalls.isEmpty {
                     if tools {
                         d["tool_calls"] = m.toolCalls.map { call -> [String: Any] in
@@ -907,7 +1280,7 @@ final class AppModel {
                         }
                     } else {
                         let desc = m.toolCalls.map { "[Used tool \($0.name) with \($0.arguments.mapValues { $0.stringValue ?? "" })]" }.joined(separator: "\n")
-                        d["content"] = (m.content + "\n" + desc).trimmingCharacters(in: .whitespacesAndNewlines)
+                        d["content"] = (m.apiContent + "\n" + desc).trimmingCharacters(in: .whitespacesAndNewlines)
                     }
                 }
                 out.append(d)
@@ -941,27 +1314,40 @@ final class AppModel {
     func pullModel(_ rawName: String) {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !isPulling else { return }
-        isPulling = true
-        pullingName = name
         pullError = nil
-        pullProgress = nil
         pullTask = Task {
             do {
-                for try await progress in client.pull(name) {
-                    if let e = progress.error { throw OllamaError.server(e) }
-                    pullProgress = progress
-                }
-                await refreshModels()
+                try await pull(name)
                 if selected?.model == nil { setModel(name) }
             } catch is CancellationError {
                 pullError = "Download of \(name) cancelled."
             } catch {
                 pullError = Task.isCancelled ? "Download of \(name) cancelled." : error.localizedDescription
             }
-            isPulling = false
-            pullProgress = nil
             pullTask = nil
         }
+    }
+
+    /// How often a download's progress is shown. Ollama reports it many times a second, and
+    /// redrawing the Models window for every report kept a core busy for the whole download.
+    private static let pullRefreshInterval: Duration = .milliseconds(250)
+
+    /// Downloads a model, showing progress in the Models window, and refreshes the list.
+    private func pull(_ name: String) async throws {
+        isPulling = true
+        pullingName = name
+        pullProgress = nil
+        defer { isPulling = false; pullProgress = nil }
+        var lastShown = ContinuousClock.now - Self.pullRefreshInterval
+        for try await progress in client.pull(name) {
+            if let e = progress.error { throw OllamaError.server(e) }
+            let now = ContinuousClock.now
+            if progress.status != pullProgress?.status || now - lastShown >= Self.pullRefreshInterval {
+                pullProgress = progress
+                lastShown = now
+            }
+        }
+        await refreshModels()
     }
 
     /// Stops an in-progress pull. Ollama aborts the download when the connection closes;
@@ -971,8 +1357,19 @@ final class AppModel {
     }
 
     func deleteModel(_ name: String) async {
+        // Benchmarks outlive the model. Remember what it could do, so its runs still answer
+        // the capability filters once Ollama no longer lists it.
+        if let caps = modelInfo(name)?.capabilities {
+            var changed = false
+            for i in benchmarkHistory.indices where benchmarkHistory[i].model == name && benchmarkHistory[i].capabilities == nil {
+                benchmarkHistory[i].capabilities = caps
+                changed = true
+            }
+            if changed { benchmarkStore.save(benchmarkHistory) }
+        }
         do {
             try await client.deleteModel(name)
+            await pruneRunnerAliases()
             await refreshModels()
             for c in conversations where c.model == name {
                 update(c.id) { $0.model = nil }
@@ -980,6 +1377,17 @@ final class AppModel {
             if settings.defaultModel == name { settings.defaultModel = models.first?.name ?? "" }
         } catch {
             errorBanner = error.localizedDescription
+        }
+    }
+
+    /// Ollama 0.40 keeps a `llamacpp:<digest>` or `mlx:<digest>` alias for every model it has
+    /// run, and the alias keeps the model's files on disk after the model itself is deleted.
+    /// Removes the aliases whose model is gone.
+    func pruneRunnerAliases() async {
+        guard let all = try? await client.listModels() else { return }
+        let kept = Set(all.filter { !$0.isRunnerAlias }.compactMap(\.digest))
+        for alias in all where alias.isRunnerAlias && !kept.contains(alias.digest ?? "") {
+            try? await client.deleteModel(alias.name)
         }
     }
 
@@ -1003,5 +1411,226 @@ final class AppModel {
     func unloadModel(_ name: String) async {
         try? await client.unloadModel(name)
         await refreshModels()
+    }
+
+    // MARK: - Model list hygiene
+
+    /// Ollama 0.40 lists a model once per stored digest and adds `llamacpp:<digest>` or
+    /// `mlx:<digest>` aliases for the runner it used. Show each installed model once,
+    /// preferring the digest Ollama actually ran, then the most recently modified.
+    nonisolated static func visibleModels(_ list: [OllamaModelInfo]) -> [OllamaModelInfo] {
+        let ranDigests = Set(list.filter(\.isRunnerAlias).compactMap(\.digest))
+        var byName: [String: OllamaModelInfo] = [:]
+        var order: [String] = []
+        for m in list where !m.isRunnerAlias {
+            guard let existing = byName[m.name] else {
+                byName[m.name] = m
+                order.append(m.name)
+                continue
+            }
+            let existingRan = ranDigests.contains(existing.digest ?? "")
+            let thisRan = ranDigests.contains(m.digest ?? "")
+            let newer = (m.modifiedDate ?? .distantPast) > (existing.modifiedDate ?? .distantPast)
+            if (thisRan && !existingRan) || (thisRan == existingRan && newer) { byName[m.name] = m }
+        }
+        return order.compactMap { byName[$0] }
+    }
+
+    // MARK: - Benchmarks
+
+    var isBenchmarking: Bool { benchmarkingModel != nil }
+
+    var ollamaVersion: String? {
+        if case .connected(let v) = status { return v } else { return nil }
+    }
+
+    func benchmark(_ name: String) { benchmarkModels([name]) }
+
+    func benchmarkAll() { benchmarkModels(models.map(\.name)) }
+
+    /// Measures the given models one after the other. Refuses while a reply is streaming,
+    /// since both would compete for the GPU and skew the numbers.
+    func benchmarkModels(_ names: [String]) {
+        guard !isBenchmarking, !names.isEmpty else { return }
+        guard !isAnyGenerating else {
+            benchmarkError = "Wait for the current reply to finish before benchmarking."
+            return
+        }
+        benchmarkError = nil
+        benchmarkQueue = names
+        benchmarkTask = Task { [weak self] in
+            guard let self else { return }
+            for name in names {
+                if Task.isCancelled { break }
+                self.benchmarkQueue.removeAll { $0 == name }
+                do {
+                    try await self.runBenchmark(name)
+                } catch is CancellationError {
+                    break
+                } catch {
+                    if Task.isCancelled { break }
+                    self.benchmarkError = "\(name): \(error.localizedDescription)"
+                }
+            }
+            self.benchmarkQueue = []
+            self.benchmarkTask = nil
+            await self.refreshModels()
+        }
+    }
+
+    /// Measures one installed model and records the run.
+    private func runBenchmark(_ name: String) async throws {
+        benchmarkingModel = name
+        benchmarkStep = "Starting…"
+        defer { benchmarkingModel = nil; benchmarkStep = "" }
+        let info = modelInfo(name)
+        var result = try await BenchmarkRunner.run(model: name, digest: info?.digest, client: client,
+                                                   contextLength: contextWindow(for: name),
+                                                   supportsThinking: info?.supportsThinking ?? false,
+                                                   ollamaVersion: ollamaVersion) { [weak self] step in
+            self?.benchmarkStep = step
+        }
+        result.capabilities = info?.capabilities
+        recordBenchmark(result)
+    }
+
+    func cancelBenchmark() {
+        benchmarkTask?.cancel()
+    }
+
+    /// Adds a run to the history, newest first, keeping the last few dozen runs per model.
+    private func recordBenchmark(_ run: ModelBenchmark) {
+        benchmarkHistory.insert(run, at: 0)
+        var kept = 0
+        benchmarkHistory.removeAll { other in
+            guard other.model == run.model else { return false }
+            kept += 1
+            return kept > BenchmarkStore.runsPerModel
+        }
+        benchmarkStore.save(benchmarkHistory)
+    }
+
+    func deleteBenchmark(_ id: ModelBenchmark.ID) {
+        benchmarkHistory.removeAll { $0.id == id }
+        benchmarkStore.save(benchmarkHistory)
+    }
+
+    func deleteBenchmarks(for modelName: String) {
+        benchmarkHistory.removeAll { $0.model == modelName }
+        benchmarkStore.save(benchmarkHistory)
+    }
+
+    // MARK: - Trials: pull, benchmark, delete
+
+    /// Models still to try, in order; the first one is being tried now.
+    var trialQueue: [String] = []
+    /// What the trial is doing right now.
+    var trialStep = ""
+    /// Models that could not be tried, with the reason. Cleared when a new trial starts.
+    var trialFailures: [String] = []
+    private var trialTask: Task<Void, Never>?
+    var isTrialRunning: Bool { trialTask != nil }
+
+    /// Pulls each model, benchmarks it and deletes it again, one after the other, so a whole
+    /// list can be measured on this Mac without keeping any of it on disk. Models that are
+    /// already installed are benchmarked and kept. While a trial runs, further names join
+    /// the end of its queue. Also started by `--try-models a,b,c` on the command line.
+    func tryModels(_ rawNames: [String]) {
+        var names = rawNames.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        // Models measured already are not tried again; the gauge button on a model re-runs it.
+        let tested = Set(benchmarkHistory.map(\.model))
+        trialSkipped = names.filter { tested.contains($0) || tested.contains($0 + ":latest") }
+        names.removeAll { trialSkipped.contains($0) }
+        if isTrialRunning {
+            names.removeAll { trialQueue.contains($0) }
+            trialQueue.append(contentsOf: names)
+            return
+        }
+        guard !isBenchmarking, !isPulling, !names.isEmpty else { return }
+        trialQueue = names
+        trialFailures = []
+        trialTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, let name = self.trialQueue.first {
+                defer { if self.trialQueue.first == name { self.trialQueue.removeFirst() } }
+                let wasInstalled = self.installedModelName(name) != nil
+                do {
+                    if !wasInstalled {
+                        self.trialStep = "Downloading"
+                        try await self.pullWithRetry(name)
+                    }
+                    // The benchmark needs the GPU to itself: let a reply in progress finish.
+                    while self.isAnyGenerating { try await Task.sleep(for: .seconds(2)) }
+                    self.trialStep = "Benchmarking"
+                    try await self.runBenchmark(self.installedModelName(name) ?? name)
+                } catch is CancellationError {
+                    // Fall through: a model this trial downloaded is still removed.
+                } catch {
+                    if !Task.isCancelled { self.trialFailures.append("\(name): \(error.localizedDescription)") }
+                }
+                if !wasInstalled, let installed = self.installedModelName(name) {
+                    self.trialStep = "Deleting"
+                    await self.deleteModel(installed)
+                }
+                // A failed or cancelled pull leaves its data on disk; take it back before the next one.
+                OllamaStore.removeLeftovers()
+                self.leftoverBytes = OllamaStore.leftoverBytes
+            }
+            self.trialQueue = []
+            self.trialStep = ""
+            self.trialTask = nil
+            await self.refreshModels()
+        }
+    }
+
+    /// Pulls a model, trying again after a pause when the network or the registry fails
+    /// (DNS lookups timing out mid-trial, for instance). A full disk or an unknown model is
+    /// not retried.
+    private func pullWithRetry(_ name: String, attempts: Int = 3) async throws {
+        for attempt in 1...attempts {
+            do {
+                try await pull(name)
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let message = error.localizedDescription.lowercased()
+                let transient = !message.contains("no space left") && !message.contains("not found") && !message.contains("manifest unknown")
+                guard attempt < attempts, transient else { throw error }
+                OllamaStore.removeLeftovers()
+                trialStep = "Download failed, trying again"
+                try await Task.sleep(for: .seconds(20))
+            }
+        }
+    }
+
+    /// Names handed to the last trial that were not tried because a benchmark of them exists.
+    var trialSkipped: [String] = []
+
+    /// Bytes of download leftovers in Ollama's store (see `OllamaStore`); refreshed by trials
+    /// and when the Models window opens.
+    var leftoverBytes: Int64 = 0
+
+    func refreshLeftovers() { leftoverBytes = OllamaStore.leftoverBytes }
+
+    func removeLeftovers() {
+        OllamaStore.removeLeftovers()
+        leftoverBytes = OllamaStore.leftoverBytes
+    }
+
+    func cancelTrial() {
+        trialTask?.cancel()
+    }
+
+    /// The installed model matching a name as typed; Ollama lists an untagged name as "name:latest".
+    private func installedModelName(_ name: String) -> String? {
+        models.first { $0.name == name || $0.name == name + ":latest" }?.name
+    }
+
+    /// Value of `--flag value` or `--flag=value` on the command line, if given.
+    nonisolated static func launchArgument(_ flag: String) -> String? {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: flag), i + 1 < args.count { return args[i + 1] }
+        return args.first { $0.hasPrefix(flag + "=") }.map { String($0.dropFirst(flag.count + 1)) }
     }
 }

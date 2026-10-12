@@ -19,7 +19,7 @@ enum TokenEstimator {
             n += tokens(forText: message.apiContent)
             n += message.attachments.filter(\.isImage).count * imageTokens
         case .assistant:
-            n += tokens(forText: message.content)
+            n += tokens(forText: message.apiContent)
             for call in message.toolCalls {
                 n += 8 + tokens(forText: call.name)
                 n += call.arguments.values.reduce(0) { $0 + tokens(forText: $1.stringValue ?? "") }
