@@ -158,7 +158,15 @@ enum ToolExecutor {
     }
 
     static func writeFile(_ path: String?, content: String, cwd: String) -> (Bool, String) {
-        let url = resolve(path, cwd: cwd)
+        let trimmedPath = (path ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else {
+            return (false, "Error: no path given. Call write_file again with a \"path\" argument, for example \"notes.md\" or an absolute path.")
+        }
+        let url = resolve(trimmedPath, cwd: cwd)
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            return (false, "Error: \(url.path) is a folder, not a file. Give a file path such as \(url.lastPathComponent)/newfile.txt.")
+        }
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try content.write(to: url, atomically: true, encoding: .utf8)
