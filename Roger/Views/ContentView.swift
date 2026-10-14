@@ -16,7 +16,6 @@ struct ContentView: View {
             }
         }
         .navigationTitle(model.selected?.title ?? "Roger")
-        .toolbar { toolbarContent }
         .sheet(isPresented: $model.showModelsSheet) {
             ModelsView().environment(model)
         }
@@ -25,41 +24,5 @@ struct ContentView: View {
         } message: {
             Text(model.errorBanner ?? "")
         }
-    }
-
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        ToolbarItemGroup(placement: .primaryAction) {
-            workingDirectoryButton
-            modelPicker
-            Button { model.showModelsSheet = true } label: { Label("Models", systemImage: "shippingbox") }
-                .help("Manage installed models (⇧⌘M)")
-        }
-    }
-
-    private var workingDirectoryButton: some View {
-        Button { model.chooseWorkingDirectory() } label: {
-            Label(URL(fileURLWithPath: model.selected?.workingDirectory ?? NSHomeDirectory()).lastPathComponent, systemImage: "folder")
-                .labelStyle(.titleAndIcon)
-        }
-        .help("Working directory: \(model.selected?.workingDirectory ?? "")\nClick to change (⇧⌘O)")
-    }
-
-    private var modelPicker: some View {
-        let current = model.currentModelName ?? ""
-        var names = model.models.map(\.name)
-        if !current.isEmpty, !names.contains(current) { names.append(current) }
-        return Picker("Model", selection: Binding(get: { current }, set: { model.setModel($0) })) {
-            if names.isEmpty {
-                Text("No models").tag("")
-            }
-            ForEach(names, id: \.self) { name in
-                Text(name).tag(name)
-            }
-        }
-        .pickerStyle(.menu)
-        .frame(minWidth: 140)
-        .help("Model used for this chat")
-        .disabled(names.isEmpty)
     }
 }

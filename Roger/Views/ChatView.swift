@@ -100,11 +100,13 @@ struct ChatView: View {
             }
             ScrollViewReader { proxy in
                 tracked(ScrollView {
-                    // A plain stack: a lazy one keeps stale sizes for rows that shrink (a thinking
-                    // section collapsing), which left an empty zone at the end and sent
-                    // scroll-to-bottom past the content. Rows are cheap to keep around: a message's
-                    // Markdown is rendered once and skipped while its text is unchanged.
-                    VStack(alignment: .leading, spacing: 18) {
+                    // Lazy: a long chat's rows are heavy (a message can hold large code blocks,
+                    // images and selectable-text overlays, tens of MB of AppKit backing store
+                    // each). Realising every row at once drove memory past 3 GB on a big
+                    // conversation, which pushed the whole machine into swap and slowed the model
+                    // to a token every several seconds. Only the rows near the viewport are now
+                    // built. Scrolling to "bottom" still works because it targets a real view id.
+                    LazyVStack(alignment: .leading, spacing: 18) {
                         if messages.isEmpty { welcome }
                         ForEach(messages) { message in
                             if message.id == d.trimBoundaryID { TrimDivider(count: d.trimmedVisibleCount) }
@@ -334,7 +336,7 @@ struct ChatView: View {
                 }
                 .buttonStyle(.plain)
             }
-            Text("Attach files with the paperclip or by dropping them on the message box. Set the working directory from the toolbar so Roger can read, edit and run things in your project.")
+            Text("Attach files with the paperclip or by dropping them on the message box. Add working folders below the message box so Roger can read, edit and run things in your project.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .padding(.top, 8)

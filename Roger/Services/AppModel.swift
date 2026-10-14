@@ -309,7 +309,10 @@ final class AppModel {
     func newConversation(in groupID: UUID?? = nil) -> Conversation {
         var c = Conversation()
         c.model = defaultModelName
-        if let cwd = selected?.workingDirectory { c.workingDirectory = cwd }
+        if let current = selected {
+            c.workingDirectory = current.workingDirectory
+            c.extraDirectories = current.extraDirectories
+        }
         // Explicit group if given, otherwise the group of the current chat.
         c.groupID = groupID ?? selected?.groupID
         conversations.insert(c, at: 0)
@@ -322,7 +325,7 @@ final class AppModel {
     func newConversation(like id: UUID) {
         guard let source = conversation(id) else { return }
         let c = newConversation(in: .some(source.groupID))
-        update(c.id) { $0.model = source.model; $0.workingDirectory = source.workingDirectory }
+        update(c.id) { $0.model = source.model; $0.workingDirectory = source.workingDirectory; $0.extraDirectories = source.extraDirectories }
     }
 
     /// A copy of a chat, messages included, with the same model, working directory and
@@ -470,15 +473,37 @@ final class AppModel {
         update(id) { $0.workingDirectory = url.path }
     }
 
-    func chooseWorkingDirectory() {
+    /// Adds a folder to the chat's working folders. A chat still in the default home
+    /// folder switches to the new one instead, since home was never a choice.
+    func addWorkingDirectory(_ url: URL) {
+        guard let id = selectedID else { return }
+        let path = url.standardizedFileURL.path
+        update(id) {
+            if $0.workingDirectories == [NSHomeDirectory()] { $0.workingDirectory = path } else { $0.addDirectory(path) }
+        }
+    }
+
+    func removeWorkingDirectory(_ path: String) {
+        guard let id = selectedID else { return }
+        update(id) { $0.removeDirectory(path) }
+    }
+
+    func makeMainDirectory(_ path: String) {
+        guard let id = selectedID else { return }
+        update(id) { $0.makeMainDirectory(path) }
+    }
+
+    func addWorkingDirectories() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Use folder"
-        panel.message = "Choose the working directory Roger should use for files and commands."
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add folders"
+        panel.message = "Choose folders Roger can work in. The chat's first folder is where commands run and relative paths resolve."
         if let cwd = selected?.workingDirectory { panel.directoryURL = URL(fileURLWithPath: cwd) }
-        if panel.runModal() == .OK, let url = panel.url { setWorkingDirectory(url) }
+        if panel.runModal() == .OK {
+            for url in panel.urls { addWorkingDirectory(url) }
+        }
     }
 
     func clearMessages() {
@@ -732,16 +757,29 @@ final class AppModel {
             // the stream, a stop and an error flush whatever is left.
             var lastRefresh = ContinuousClock.now - Self.streamRefreshInterval
             var trailingRefresh: Task<Void, Never>?
+            // A runaway reply (a model stuck repeating itself streams tens of KB in seconds)
+            // is refreshed less often as it grows, so the work per second stays bounded. The
+            // chat's own size no longer matters here: only the rows near the viewport are laid
+            // out (the list is lazy), so a long conversation is not re-laid-out on every token.
+            func refreshInterval() -> Duration {
+                let bytes = rawContent.utf8.count + apiThinking.utf8.count
+                switch bytes {
+                case ..<16_000: return Self.streamRefreshInterval       // 50 ms
+                case ..<64_000: return Self.streamRefreshInterval * 3   // 150 ms
+                default: return Self.streamRefreshInterval * 6          // 300 ms
+                }
+            }
             func refreshText() {
                 let now = ContinuousClock.now
                 let sinceLast = now - lastRefresh
-                if sinceLast >= Self.streamRefreshInterval {
+                let interval = refreshInterval()
+                if sinceLast >= interval {
                     trailingRefresh?.cancel()
                     trailingRefresh = nil
                     lastRefresh = now
                     applyText()
                 } else if trailingRefresh == nil {
-                    let delay = Self.streamRefreshInterval - sinceLast
+                    let delay = interval - sinceLast
                     trailingRefresh = Task {
                         try? await Task.sleep(for: delay)
                         guard !Task.isCancelled else { return }
@@ -1177,10 +1215,14 @@ final class AppModel {
 
     private func systemPrompt(for convo: Conversation, tools: Bool, trimmedMessages: Int = 0) -> String {
         let date = Date().formatted(date: .long, time: .omitted)
+        var folders = "The working directory is: \(convo.workingDirectory)"
+        if !convo.extraDirectories.isEmpty {
+            folders += "\nThe user also added these folders, which you reach by absolute path: " + convo.extraDirectories.joined(separator: ", ")
+        }
         var p = """
         You are Roger, a helpful coding assistant running locally on the user's Mac through Ollama. \
         You answer questions, write code, analyse bugs and help with the user's files.
-        Today is \(date). The working directory is: \(convo.workingDirectory)
+        Today is \(date). \(folders)
         Format answers in Markdown. Put code in fenced code blocks with a language tag. Be concise and precise. Always write your final answer as your visible response, never only inside your private reasoning.
         """
         if tools {

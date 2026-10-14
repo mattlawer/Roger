@@ -64,11 +64,18 @@ struct ComposerView: View {
                     .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(isTargeted ? Color.accentColor : Color.secondary.opacity(0.25), lineWidth: isTargeted ? 2 : 1))
             )
-            HStack(alignment: .firstTextBaseline) {
+            HStack(spacing: 6) {
+                WorkingFoldersBar()
                 if let dropMessage {
                     Text(dropMessage).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
                 }
-                Spacer()
+                Spacer(minLength: 8)
+                modelPicker
+                Button { model.showModelsSheet = true } label: { Image(systemName: "shippingbox") }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Models")
+                    .help("Manage installed models (⇧⌘M)")
                 if let convo = model.selected {
                     ContextMeter(plan: model.contextPlan(for: convo), modelName: model.currentModelName,
                                  configuredWindow: model.settings.contextLength,
@@ -77,7 +84,8 @@ struct ComposerView: View {
                                  cutCount: model.cuttableMessageCount) { model.cutTrimmedMessages() }
                 }
             }
-            .frame(minHeight: 14)
+            .controlSize(.small)
+            .frame(minHeight: 22)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -87,6 +95,26 @@ struct ComposerView: View {
         }
         .onAppear { focusRequest += 1 }
         .onChange(of: model.selectedID) { _, _ in focusRequest += 1 }
+    }
+
+    private var modelPicker: some View {
+        let current = model.currentModelName ?? ""
+        var names = model.models.map(\.name)
+        if !current.isEmpty, !names.contains(current) { names.append(current) }
+        return Picker("Model", selection: Binding(get: { current }, set: { model.setModel($0) })) {
+            if names.isEmpty {
+                Text("No models").tag("")
+            }
+            ForEach(names, id: \.self) { name in
+                Text(name).tag(name)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .frame(minWidth: 120, maxWidth: 260)
+        .fixedSize()
+        .help("Model used for this chat")
+        .disabled(names.isEmpty)
     }
 
     private var imageConflictBar: some View {
@@ -137,7 +165,7 @@ struct ComposerView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
-        panel.message = "Attach files to your message. Choosing a folder sets it as the working directory."
+        panel.message = "Attach files to your message. Choosing a folder adds it to the chat's working folders."
         if panel.runModal() == .OK {
             for url in panel.urls { add(url) }
         }
@@ -158,10 +186,51 @@ struct ComposerView: View {
             if !attachments.contains(where: { $0.path == a.path }) { attachments.append(a) }
             dropMessage = nil
         case .directory(let dir):
-            model.setWorkingDirectory(dir)
-            dropMessage = "Working directory set to \(dir.path)"
+            model.addWorkingDirectory(dir)
+            dropMessage = nil
         case .unsupported(let reason):
             dropMessage = reason
+        }
+    }
+}
+
+/// The folders the chat works in, as chips under the message box. The first is the
+/// working directory, where commands run and relative paths resolve; the others are
+/// reached by absolute path. A chip's menu promotes, reveals or removes its folder.
+struct WorkingFoldersBar: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if let convo = model.selected {
+            HStack(spacing: 4) {
+                ForEach(Array(convo.workingDirectories.enumerated()), id: \.element) { index, path in
+                    Menu {
+                        if index > 0 {
+                            Button("Make Working Directory") { model.makeMainDirectory(path) }
+                        }
+                        Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
+                        Divider()
+                        Button("Remove", role: .destructive) { model.removeWorkingDirectory(path) }
+                    } label: {
+                        Label(URL(fileURLWithPath: path).lastPathComponent, systemImage: index == 0 ? "folder.fill" : "folder")
+                            .labelStyle(.titleAndIcon)
+                            .lineLimit(1)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.secondary.opacity(index == 0 ? 0.16 : 0.09), in: Capsule())
+                    .help(index == 0
+                          ? "Working directory: \(path)\nCommands run here and relative paths resolve here."
+                          : "Added folder: \(path)\nThe model reaches it by absolute path.")
+                }
+                Button { model.addWorkingDirectories() } label: { Image(systemName: "plus") }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Add Working Folder")
+                    .help("Add a folder Roger can work in (⇧⌘O). Dropping a folder on the message box adds it too.")
+            }
         }
     }
 }

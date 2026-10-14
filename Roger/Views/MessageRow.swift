@@ -117,7 +117,7 @@ struct MessageRow: View {
                     ThinkingView(messageID: message.id, text: thinking, isStreaming: message.isStreaming && message.content.isEmpty)
                 }
                 if !message.content.isEmpty {
-                    MarkdownView(text: message.content, selectable: !message.isStreaming)
+                    MarkdownView(text: message.content, selectable: !message.isStreaming, streaming: message.isStreaming).equatable()
                 }
                 ForEach(message.toolCalls) { call in
                     ToolCallCard(call: call, messageID: message.id)
@@ -241,7 +241,7 @@ struct ThinkingView: View {
                 }
             }
             if expanded {
-                MarkdownView(text: text, selectable: !isStreaming, compact: true)
+                MarkdownView(text: text, selectable: !isStreaming, compact: true, streaming: isStreaming).equatable()
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.leading, 18)

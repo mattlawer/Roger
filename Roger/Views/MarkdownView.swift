@@ -6,9 +6,7 @@ enum MarkdownBlock: Hashable {
     case heading(Int, String)
     /// `complete` is false while the closing fence has not arrived yet (a streaming reply).
     case code(lang: String, code: String, complete: Bool)
-    /// `start` is the number of the first item of an ordered list, so a list that a code
-    /// block or a paragraph interrupted continues its numbering.
-    case list(items: [String], ordered: Bool, start: Int)
+    case list(items: [ListItem])
     case quote(String)
     case table([String])
     case rule
@@ -17,15 +15,35 @@ enum MarkdownBlock: Hashable {
     case image(alt: String, source: String, explicit: Bool)
 }
 
+/// One item of a list, with its nesting depth and the marker to show: a bullet, or the
+/// item's own number for an ordered list, so a list that a code block or a paragraph
+/// interrupted keeps its numbering.
+struct ListItem: Hashable {
+    var text: String
+    var level: Int
+    var marker: String
+}
+
 enum MarkdownParser {
+    /// Parsed blocks are cached by source text. While a reply streams, the growing text is a
+    /// new key each refresh (a miss, but parsing a small reply is cheap); once a runaway reply
+    /// passes the render cap the shown head stops changing, so every later refresh is a hit and
+    /// costs nothing, instead of re-parsing kilobytes twenty times a second.
+    private static let cache = RenderCache<[MarkdownBlock]>(capacity: 256)
     static func parse(_ text: String) -> [MarkdownBlock] {
+        cache.value(for: text) { parseUncached(text) }
+    }
+
+    private static func parseUncached(_ text: String) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
-        let lines = text.components(separatedBy: "\n")
+        var lines = text.components(separatedBy: "\n")
         var i = 0
         var paragraph: [String] = []
-        var listItems: [String] = []
-        var listOrdered = false
-        var listStart = 1
+        var listItems: [ListItem] = []
+        /// Indentation widths of the open nesting levels, outermost first.
+        var listIndents: [Int] = []
+        /// Next number of an ordered item per level, when the model numbers nothing.
+        var listCounts: [Int: Int] = [:]
         var quote: [String] = []
         var table: [String] = []
         /// The block most recently added was a list: indented lines that follow belong to it
@@ -44,14 +62,16 @@ enum MarkdownParser {
         func flushList() {
             if !listItems.isEmpty {
                 var images: [MarkdownBlock] = []
-                let items = listItems.map { item -> String in
-                    let (text, found) = extractImages(item)
+                let items = listItems.map { item -> ListItem in
+                    let (text, found) = extractImages(item.text)
                     images.append(contentsOf: found)
-                    return text
+                    return ListItem(text: text, level: item.level, marker: item.marker)
                 }
-                blocks.append(.list(items: items, ordered: listOrdered, start: listStart))
+                blocks.append(.list(items: items))
                 blocks.append(contentsOf: images)
                 listItems = []
+                listIndents = []
+                listCounts = [:]
                 afterList = true
             }
         }
@@ -94,6 +114,9 @@ enum MarkdownParser {
                     i += 1
                     continue
                 }
+                // A code block inside a list item keeps the list open: the indented text that
+                // follows it is the item's continuation, not an indented code block.
+                let inList = !listItems.isEmpty || afterList
                 flushAll()
                 var code: [String] = []
                 i += 1
@@ -101,7 +124,7 @@ enum MarkdownParser {
                     code.append(lines[i]); i += 1
                 }
                 blocks.append(.code(lang: lang, code: code.joined(separator: "\n"), complete: i < lines.count))
-                afterList = false
+                afterList = inList
                 i += 1
                 continue
             }
@@ -114,21 +137,35 @@ enum MarkdownParser {
             // often write instead of fences. It cannot interrupt a paragraph or a list, where
             // such lines are continuation text. Blank lines inside it are kept; trailing ones
             // are left to the normal flow.
-            if paragraph.isEmpty, listItems.isEmpty, quote.isEmpty, table.isEmpty, !afterList, isIndentedCode(line) {
-                var code: [String] = []
+            // An indented list item is a list, however deep the indent.
+            if paragraph.isEmpty, listItems.isEmpty, quote.isEmpty, table.isEmpty, !afterList, isIndentedCode(line), parseListItem(line) == nil {
+                // Gather the contiguous indented region (blank lines within it are kept).
+                var region: [String] = []
                 var j = i
                 var pendingBlank = 0
                 while j < lines.count {
                     let l = lines[j]
                     if l.trimmingCharacters(in: .whitespaces).isEmpty { pendingBlank += 1; j += 1; continue }
                     guard isIndentedCode(l) else { break }
-                    code.append(contentsOf: Array(repeating: "", count: pendingBlank)); pendingBlank = 0
-                    code.append(dedent(l))
+                    region.append(contentsOf: Array(repeating: "", count: pendingBlank)); pendingBlank = 0
+                    region.append(l)
                     j += 1
                 }
+                let end = j - pendingBlank
+                // Some models (Gemma 4, for one) indent whole reasoning sections, not just
+                // code. If the region reads as prose (a sentence, emphasis, math or a list),
+                // it is not a code block: dedent it by its common indent and let it parse as
+                // normal Markdown, which wraps. Otherwise it is indented code, as before.
+                if indentedRegionIsProse(region) {
+                    let indent = region.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                        .map(leadingWidth).min() ?? 0
+                    let dedented = region.map { $0.trimmingCharacters(in: .whitespaces).isEmpty ? "" : dropLeading($0, indent) }
+                    lines.replaceSubrange(i..<end, with: dedented)
+                    continue
+                }
                 // Still growing while the reply streams unless something follows it.
-                blocks.append(.code(lang: "", code: code.joined(separator: "\n"), complete: j < lines.count))
-                i = j - pendingBlank
+                blocks.append(.code(lang: "", code: region.map(dedent).joined(separator: "\n"), complete: end < lines.count))
+                i = end
                 continue
             }
 
@@ -156,15 +193,27 @@ enum MarkdownParser {
 
             if let item = parseListItem(line) {
                 flushParagraph(); flushQuote(); flushTable()
-                if !listItems.isEmpty, listOrdered != item.ordered { flushList() }
-                if listItems.isEmpty { listStart = item.number ?? 1 }
-                listOrdered = item.ordered
-                listItems.append(item.text)
+                // Nesting follows the indentation: deeper than the current level opens one,
+                // shallower closes levels until one matches.
+                let indent = line.prefix { $0 == " " || $0 == "\t" }.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) }
+                while let last = listIndents.last, last > indent { listIndents.removeLast() }
+                if listIndents.last != indent { listIndents.append(indent) }
+                let level = listIndents.count - 1
+                listCounts = listCounts.filter { $0.key <= level }
+                let marker: String
+                if item.ordered {
+                    let number = item.number ?? listCounts[level, default: 1]
+                    listCounts[level] = number + 1
+                    marker = "\(number)."
+                } else {
+                    marker = level == 0 ? "•" : level == 1 ? "◦" : "▪"
+                }
+                listItems.append(ListItem(text: item.text, level: level, marker: marker))
                 i += 1; continue
             }
 
             if !listItems.isEmpty, line.hasPrefix("  ") || line.hasPrefix("\t") {
-                listItems[listItems.count - 1] += "\n" + trimmed
+                listItems[listItems.count - 1].text += "\n" + trimmed
                 i += 1; continue
             }
 
@@ -218,6 +267,61 @@ enum MarkdownParser {
         line.hasPrefix("    ") || line.hasPrefix("\t")
     }
 
+    /// Columns of leading indentation, a tab counting as four.
+    private static func leadingWidth(_ line: String) -> Int {
+        var n = 0
+        for ch in line {
+            if ch == " " { n += 1 } else if ch == "\t" { n += 4 } else { break }
+        }
+        return n
+    }
+
+    /// `line` with `width` columns of leading indentation removed (tabs count as four).
+    private static func dropLeading(_ line: String, _ width: Int) -> String {
+        var remaining = width
+        var idx = line.startIndex
+        while remaining > 0, idx < line.endIndex {
+            if line[idx] == " " { remaining -= 1 } else if line[idx] == "\t" { remaining -= 4 } else { break }
+            idx = line.index(after: idx)
+        }
+        return String(line[idx...])
+    }
+
+    /// Whether an indented block is prose a model merely indented, not a code block. The
+    /// tells are a list item with words, inline `$…$` math, Markdown emphasis, or a plain
+    /// sentence. Real code seldom has any of these, so it still renders as code.
+    private static func indentedRegionIsProse(_ region: [String]) -> Bool {
+        for raw in region {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { continue }
+            if let item = parseListItem(t), item.text.contains(" ") { return true }
+            if hasInlineMath(t) || hasEmphasis(t) || sentenceLike(t) { return true }
+        }
+        return false
+    }
+
+    private static func hasInlineMath(_ t: String) -> Bool {
+        guard let first = t.firstIndex(of: "$") else { return false }
+        let after = t.index(after: first)
+        guard after < t.endIndex, t[after] != " " else { return false }
+        return t[after...].contains("$")
+    }
+
+    private static func hasEmphasis(_ t: String) -> Bool {
+        if t.range(of: "\\*\\*\\S", options: .regularExpression) != nil { return true }
+        if t.range(of: "\\*[^\\s*][^*]*\\*", options: .regularExpression) != nil { return true }
+        if t.range(of: "(^|[^A-Za-z0-9_])_[^\\s_][^_]*_([^A-Za-z0-9_]|$)", options: .regularExpression) != nil { return true }
+        return false
+    }
+
+    /// A natural-language sentence: begins with a capital letter, has several words, and ends
+    /// in sentence punctuation. Code rarely matches, so it is left as code.
+    private static func sentenceLike(_ t: String) -> Bool {
+        guard let first = t.first, first.isLetter, first.isUppercase else { return false }
+        guard let last = t.last, ".?!".contains(last) else { return false }
+        return t.split(separator: " ").count >= 5
+    }
+
     private static func dedent(_ line: String) -> String {
         line.hasPrefix("\t") ? String(line.dropFirst()) : String(line.dropFirst(4))
     }
@@ -251,7 +355,7 @@ enum MarkdownParser {
 
 /// Renders Markdown text. It stores only comparable values (no closures), so SwiftUI skips
 /// it entirely while its text is unchanged.
-struct MarkdownView: View {
+struct MarkdownView: View, Equatable {
     let text: String
     /// Offer to send the output of a command run from a code block back to the model.
     var canSendOutput = true
@@ -261,17 +365,63 @@ struct MarkdownView: View {
     var selectable = true
     /// Smaller headings, for the thinking section.
     var compact = false
+    /// The reply is still arriving. Only then is a very long message clamped for display: a
+    /// runaway reply is re-laid-out on every refresh, so its cost must stay bounded; a
+    /// finished message is rendered once and shown in full.
+    var streaming = false
+
+    /// Equal when the same text would be shown: the flags match and the clamped head is the
+    /// same. SwiftUI then skips re-rendering a reply that has already grown past the render
+    /// cap, so a model stuck repeating itself no longer re-lays-out the block twenty times a
+    /// second.
+    static func == (a: MarkdownView, b: MarkdownView) -> Bool {
+        guard a.canSendOutput == b.canSendOutput, a.selectable == b.selectable,
+              a.compact == b.compact, a.streaming == b.streaming else { return false }
+        return a.shownText == b.shownText
+    }
+
+    /// The text actually laid out: clamped to the render cap only while streaming.
+    private var shownText: String { streaming ? Self.clamp(text).text : text }
+
+    /// How much of a message is laid out as Markdown. A reply that runs away (a model stuck
+    /// repeating itself streams tens of thousands of characters in seconds) is parsed and,
+    /// while it is still open, rendered line by line on every refresh; past this size that
+    /// work pegs a core. Only the start is shown, with a note; the full text is still copied,
+    /// searched and sent to the model from the message itself.
+    static let maxRenderBytes = 16_000
 
     var body: some View {
+        let shown = streaming ? Self.clamp(text) : (text: text, omitted: 0)
         // Blocks are identified by position, so the paragraph or code block at the end of a
         // streaming reply is updated in place on every refresh instead of being replaced.
-        let blocks = MarkdownParser.parse(text)
+        let blocks = MarkdownParser.parse(shown.text)
         return VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 render(block)
             }
+            if shown.omitted > 0 {
+                Text("… \(shown.omitted.formatted()) more characters not shown. Use Copy to get the whole message.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.top, 2)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The leading part of `text` to render, cut at a line break near the limit, with the
+    /// number of characters left out.
+    private static func clamp(_ text: String) -> (text: String, omitted: Int) {
+        guard text.utf8.count > maxRenderBytes else { return (text, 0) }
+        var end = text.startIndex
+        var bytes = 0
+        var lastBreak: String.Index?
+        while end < text.endIndex, bytes < maxRenderBytes {
+            if text[end] == "\n" { lastBreak = end }
+            bytes += String(text[end]).utf8.count
+            end = text.index(after: end)
+        }
+        let cut = lastBreak.map { text.index(after: $0) } ?? end
+        return (String(text[..<cut]), text.distance(from: cut, to: text.endIndex))
     }
 
     @ViewBuilder
@@ -287,15 +437,22 @@ struct MarkdownView: View {
                 .selectable(selectable)
         case .code(let lang, let code, let complete):
             CodeBlockView(language: lang, code: code, complete: complete, canSendOutput: canSendOutput, selectable: selectable)
-        case .list(let items, let ordered, let start):
+        case .list(let items):
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
+                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(ordered ? "\(start + idx)." : "•")
+                        Text(item.marker)
                             .foregroundStyle(.secondary)
                             .frame(minWidth: 16, alignment: .trailing)
-                        Text(inline(item)).selectable(selectable)
+                        // Claim the remaining width and grow in height: without this a long
+                        // nested item sometimes takes its one-line ideal width and is
+                        // truncated with an ellipsis instead of wrapping.
+                        Text(inline(item.text))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .selectable(selectable)
                     }
+                    .padding(.leading, CGFloat(item.level) * 20)
                 }
             }
         case .quote(let s):
@@ -350,8 +507,9 @@ struct MarkdownView: View {
 
     private func inline(_ s: String) -> AttributedString {
         Self.inlineCache.value(for: s) {
-            (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-                ?? AttributedString(s)
+            let text = MathText.rendering(s)
+            return (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                ?? AttributedString(text)
         }
     }
 }
@@ -424,6 +582,10 @@ struct CodeBlockView: View {
                 Group {
                     if complete || selectable {
                         Text(SyntaxHighlighter.highlight(code, language: language))
+                            // Take the full height: inside the reasoning section's styled
+                            // container a multi-line Text otherwise collapses to one line
+                            // ending in an ellipsis.
+                            .fixedSize(horizontal: false, vertical: true)
                             .selectable(selectable)
                     } else {
                         let lines = code.split(separator: "\n", omittingEmptySubsequences: false)
@@ -432,6 +594,7 @@ struct CodeBlockView: View {
                                 Text(lines[i].isEmpty ? " " : String(lines[i]))
                             }
                         }
+                        .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 .font(.system(.callout, design: .monospaced))
@@ -667,4 +830,216 @@ struct TableLayout: Layout {
                        proposal: ProposedViewSize(width: widths[col], height: heights[row]))
         }
     }
+}
+
+/// Turns TeX math spans in chat text into plain Unicode, so `$CO_2$` reads as CO₂ and
+/// `$\alpha \leq \beta$` as α ≤ β, without a math typesetter. The constructs models use in
+/// conversation are covered: sub- and superscripts, Greek letters, operators and arrows,
+/// fractions, roots, \text and friends. Anything else keeps its characters, minus the
+/// backslashes and braces. Code spans are left alone, and a lone dollar sign (a price) is
+/// not math: like Pandoc, an opening `$` needs a non-space right after it and a closing `$`
+/// a non-space right before it and no digit after it.
+enum MathText {
+    static func rendering(_ s: String) -> String {
+        guard s.contains("$") || s.contains("\\(") || s.contains("\\[") else { return s }
+        var out = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            if c == "`" {
+                // A code span is copied as it is, up to the matching run of backticks.
+                var run = i
+                while run < s.endIndex, s[run] == "`" { run = s.index(after: run) }
+                let ticks = String(s[i..<run])
+                if let close = s.range(of: ticks, range: run..<s.endIndex) {
+                    out += s[i..<close.upperBound]; i = close.upperBound
+                } else {
+                    out += ticks; i = run
+                }
+                continue
+            }
+            if c == "\\" {
+                let next = s.index(after: i)
+                if next < s.endIndex {
+                    let n = s[next]
+                    if n == "$" { out.append("$"); i = s.index(after: next); continue }
+                    if n == "(" || n == "[" {
+                        let bodyStart = s.index(after: next)
+                        if let close = s.range(of: n == "(" ? "\\)" : "\\]", range: bodyStart..<s.endIndex) {
+                            out += convert(String(s[bodyStart..<close.lowerBound])); i = close.upperBound; continue
+                        }
+                    }
+                }
+                out.append(c); i = next; continue
+            }
+            if c == "$", let span = mathSpan(in: s, from: i) {
+                out += convert(span.body); i = span.end; continue
+            }
+            out.append(c); i = s.index(after: i)
+        }
+        return out
+    }
+
+    /// The math span opening at `start` (a `$`): its TeX body and the index after it.
+    private static func mathSpan(in s: String, from start: String.Index) -> (body: String, end: String.Index)? {
+        let afterDollar = s.index(after: start)
+        guard afterDollar < s.endIndex else { return nil }
+        if s[afterDollar] == "$" {
+            let bodyStart = s.index(after: afterDollar)
+            guard let close = s.range(of: "$$", range: bodyStart..<s.endIndex) else { return nil }
+            let body = String(s[bodyStart..<close.lowerBound])
+            guard !body.isEmpty, body.utf8.count <= 2000 else { return nil }
+            return (body, close.upperBound)
+        }
+        guard !s[afterDollar].isWhitespace else { return nil }
+        var j = afterDollar
+        var previous: Character = "$"
+        var length = 0
+        while j < s.endIndex {
+            let c = s[j]
+            if c == "$", previous != "\\", !previous.isWhitespace {
+                let after = s.index(after: j)
+                if after == s.endIndex || !s[after].isNumber {
+                    return (String(s[afterDollar..<j]), after)
+                }
+            }
+            // A span never crosses a blank line or runs into a code span.
+            if c == "`" || (c == "\n" && previous == "\n") { return nil }
+            length += 1
+            if length > 400 { return nil }
+            previous = c
+            j = s.index(after: j)
+        }
+        return nil
+    }
+
+    static func convert(_ tex: String) -> String {
+        var parser = Parser(Array(tex))
+        return parser.sequence(until: nil).trimmingCharacters(in: .whitespaces)
+    }
+
+    private struct Parser {
+        let chars: [Character]
+        var i = 0
+        init(_ chars: [Character]) { self.chars = chars }
+
+        mutating func sequence(until terminator: Character?) -> String {
+            var out = ""
+            while i < chars.count {
+                let c = chars[i]
+                if let terminator, c == terminator { i += 1; return out }
+                switch c {
+                case "{": i += 1; out += sequence(until: "}")
+                case "}": i += 1
+                case "\\":
+                    i += 1
+                    let symbol = command()
+                    out += symbol
+                    // TeX swallows the space after a command: "\\Delta G" is ΔG. Only a
+                    // letter-like symbol does so here, so "\\sin x" and "a \\times b" keep theirs.
+                    if symbol.count == 1, symbol.first!.isLetter {
+                        var j = i
+                        while j < chars.count, chars[j] == " " { j += 1 }
+                        if j > i, j < chars.count, chars[j].isLetter || chars[j].isNumber { i = j }
+                    }
+                case "_": i += 1; out += script(atom(), MathText.subscripts, marker: "_")
+                case "^": i += 1; out += script(atom(), MathText.superscripts, marker: "^")
+                case "~", "&": i += 1; out += " "
+                default: out.append(c); i += 1
+                }
+            }
+            return out
+        }
+
+        /// One argument: a braced group, a command, or a single character.
+        mutating func atom() -> String {
+            guard i < chars.count else { return "" }
+            let c = chars[i]
+            if c == "{" { i += 1; return sequence(until: "}") }
+            if c == "\\" { i += 1; return command() }
+            i += 1
+            return String(c)
+        }
+
+        mutating func command() -> String {
+            var name = ""
+            while i < chars.count, chars[i].isLetter { name.append(chars[i]); i += 1 }
+            if name.isEmpty {
+                guard i < chars.count else { return "" }
+                let c = chars[i]; i += 1
+                switch c {
+                case ",", ";", ":", " ": return " "
+                case "!": return ""
+                case "\\": return "; "
+                default: return String(c)
+                }
+            }
+            switch name {
+            case "frac", "dfrac", "tfrac":
+                let a = atom(), b = atom()
+                return group(a) + "/" + group(b)
+            case "sqrt":
+                if i < chars.count, chars[i] == "[" {
+                    while i < chars.count, chars[i] != "]" { i += 1 }
+                    i += 1
+                }
+                let a = atom()
+                return "√" + (a.count == 1 ? a : "(" + a + ")")
+            case "text", "textrm", "textbf", "textit", "textsf", "texttt", "mathrm", "mathbf", "mathit", "mathsf", "mathtt", "mathcal", "mathbb", "mathfrak", "boldsymbol", "bm", "operatorname", "hat", "vec", "bar", "tilde", "dot", "ddot", "overline", "underline", "widehat", "widetilde":
+                return atom()
+            case "begin", "end":
+                _ = atom()
+                return ""
+            case "left", "right", "displaystyle", "textstyle", "scriptstyle", "limits", "nolimits", "mathstrut", "nonumber", "notag":
+                return ""
+            case "quad", "qquad":
+                return "  "
+            default:
+                return MathText.symbols[name] ?? name
+            }
+        }
+
+        /// A sub- or superscript in Unicode when every character has a form; otherwise the
+        /// TeX marker stays, with parentheses around a multi-character script.
+        func script(_ s: String, _ map: [Character: Character], marker: String) -> String {
+            let mapped = s.compactMap { map[$0] }
+            if mapped.count == s.count, !s.isEmpty { return String(mapped) }
+            return marker + (s.count > 1 ? "(" + s + ")" : s)
+        }
+
+        /// A fraction part in parentheses unless it is a single token.
+        func group(_ s: String) -> String {
+            s.count <= 1 || s.allSatisfy({ $0.isLetter || $0.isNumber }) ? s : "(" + s + ")"
+        }
+    }
+
+    static let subscripts: [Character: Character] = [
+        "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+        "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
+        "a": "ₐ", "e": "ₑ", "h": "ₕ", "i": "ᵢ", "j": "ⱼ", "k": "ₖ", "l": "ₗ", "m": "ₘ", "n": "ₙ", "o": "ₒ", "p": "ₚ", "r": "ᵣ", "s": "ₛ", "t": "ₜ", "u": "ᵤ", "v": "ᵥ", "x": "ₓ",
+        "β": "ᵦ", "γ": "ᵧ", "ρ": "ᵨ", "φ": "ᵩ", "χ": "ᵪ",
+    ]
+
+    static let superscripts: [Character: Character] = [
+        "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+        "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾",
+        "a": "ᵃ", "b": "ᵇ", "c": "ᶜ", "d": "ᵈ", "e": "ᵉ", "f": "ᶠ", "g": "ᵍ", "h": "ʰ", "i": "ⁱ", "j": "ʲ", "k": "ᵏ", "l": "ˡ", "m": "ᵐ", "n": "ⁿ", "o": "ᵒ", "p": "ᵖ", "r": "ʳ", "s": "ˢ", "t": "ᵗ", "u": "ᵘ", "v": "ᵛ", "w": "ʷ", "x": "ˣ", "y": "ʸ", "z": "ᶻ",
+        "A": "ᴬ", "B": "ᴮ", "D": "ᴰ", "E": "ᴱ", "G": "ᴳ", "H": "ᴴ", "I": "ᴵ", "J": "ᴶ", "K": "ᴷ", "L": "ᴸ", "M": "ᴹ", "N": "ᴺ", "O": "ᴼ", "P": "ᴾ", "R": "ᴿ", "T": "ᵀ", "U": "ᵁ", "V": "ⱽ", "W": "ᵂ",
+        "α": "ᵅ", "β": "ᵝ", "γ": "ᵞ", "δ": "ᵟ", "φ": "ᵠ", "χ": "ᵡ", "θ": "ᶿ",
+    ]
+
+    static let symbols: [String: String] = [
+        "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "vartheta": "ϑ", "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ", "pi": "π", "varpi": "ϖ", "rho": "ρ", "varrho": "ϱ", "sigma": "σ", "varsigma": "ς", "tau": "τ", "upsilon": "υ", "phi": "φ", "varphi": "ϕ", "chi": "χ", "psi": "ψ", "omega": "ω",
+        "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ", "Pi": "Π", "Sigma": "Σ", "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
+        "times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓", "ast": "∗", "star": "⋆", "circ": "∘", "bullet": "•",
+        "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠", "approx": "≈", "equiv": "≡", "sim": "∼", "simeq": "≃", "cong": "≅", "propto": "∝", "ll": "≪", "gg": "≫",
+        "infty": "∞", "partial": "∂", "nabla": "∇", "sum": "∑", "prod": "∏", "int": "∫", "iint": "∬", "iiint": "∭", "oint": "∮",
+        "rightarrow": "→", "to": "→", "leftarrow": "←", "gets": "←", "Rightarrow": "⇒", "Leftarrow": "⇐", "leftrightarrow": "↔", "Leftrightarrow": "⇔", "mapsto": "↦", "uparrow": "↑", "downarrow": "↓", "implies": "⇒", "iff": "⇔", "longrightarrow": "⟶", "longleftarrow": "⟵",
+        "forall": "∀", "exists": "∃", "nexists": "∄", "in": "∈", "notin": "∉", "ni": "∋", "subset": "⊂", "subseteq": "⊆", "supset": "⊃", "supseteq": "⊇", "cup": "∪", "cap": "∩", "setminus": "∖", "emptyset": "∅", "varnothing": "∅",
+        "neg": "¬", "lnot": "¬", "land": "∧", "wedge": "∧", "lor": "∨", "vee": "∨", "oplus": "⊕", "otimes": "⊗", "perp": "⊥", "parallel": "∥", "angle": "∠", "triangle": "△",
+        "ldots": "…", "cdots": "⋯", "vdots": "⋮", "ddots": "⋱", "dots": "…",
+        "langle": "⟨", "rangle": "⟩", "lfloor": "⌊", "rfloor": "⌋", "lceil": "⌈", "rceil": "⌉", "lbrace": "{", "rbrace": "}", "lvert": "|", "rvert": "|", "lVert": "‖", "rVert": "‖", "vert": "|", "Vert": "‖",
+        "hbar": "ℏ", "ell": "ℓ", "Re": "ℜ", "Im": "ℑ", "aleph": "ℵ", "wp": "℘", "degree": "°", "prime": "′", "dagger": "†", "ddagger": "‡", "checkmark": "✓",
+        "%": "%", "#": "#", "&": "&", "_": "_",
+    ]
 }

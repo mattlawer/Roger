@@ -25,7 +25,7 @@ struct RogerApp: App {
             CommandMenu("Roger") {
                 Button("Manage Models…") { model.showModelsSheet = true }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
-                Button("Choose Working Directory…") { model.chooseWorkingDirectory() }
+                Button("Add Working Folder…") { model.addWorkingDirectories() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                 Divider()
                 Button("Clear Chat") { model.clearMessages() }
